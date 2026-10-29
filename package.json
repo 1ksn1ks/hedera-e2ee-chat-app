@@ -1,0 +1,48 @@
+{
+  "name": "hedera-e2ee-chat",
+  "version": "0.0.1",
+  "private": true,
+  "scripts": {
+    "android": "react-native run-android",
+    "ios": "react-native run-ios",
+    "start": "react-native start",
+    "start:web": "vite",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@hashgraph/sdk": "^2.81.0",
+    "@react-native-async-storage/async-storage": "^3.1.1",
+    "@walletconnect/modal": "^2.7.0",
+    "@walletconnect/react-native-compat": "^2.23.10",
+    "@walletconnect/universal-provider": "^2.23.10",
+    "libsodium-wrappers-sumo": "^0.8.4",
+    "react": "19.2.3",
+    "react-dom": "19.2.3",
+    "react-native": "0.86.0",
+    "react-native-get-random-values": "^2.0.0",
+    "react-native-keychain": "^9.2.2",
+    "react-native-safe-area-context": "^5.5.2",
+    "react-native-svg": "^15.15.5",
+    "react-native-url-polyfill": "^4.0.0",
+    "react-native-web": "^0.21.4",
+    "text-encoding": "^0.7.0"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.25.2",
+    "@babel/preset-env": "^7.25.3",
+    "@babel/runtime": "^7.25.0",
+    "@react-native-community/cli": "20.1.0",
+    "@react-native-community/cli-platform-android": "20.1.0",
+    "@react-native-community/cli-platform-ios": "20.1.0",
+    "@react-native/babel-preset": "0.86.0",
+    "@react-native/metro-config": "0.86.0",
+    "@react-native/typescript-config": "0.86.0",
+    "@types/react": "^19.2.0",
+    "@vitejs/plugin-react": "^6.1.2",
+    "typescript": "^5.8.3",
+    "vite": "^8.3.4"
+  },
+  "engines": {
+    "node": ">= 22.11.0"
+  }
+}

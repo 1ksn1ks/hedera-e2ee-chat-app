@@ -1,0 +1,32 @@
+# dependencies
+node_modules/
+dist/
+build/
+out/
+.next/
+coverage/
+.cache/
+.turbo/
+.vite/
+
+# native
+android/.gradle/
+android/app/build/
+android/build/
+ios/Pods/
+ios/build/
+*.orig
+
+# secrets — never commit, never zip
+.env
+.env.*
+!.env.example
+*.keystore
+*.jks
+google-services.json
+GoogleService-Info.plist
+
+# misc
+.DS_Store
+Thumbs.db
+*.log
