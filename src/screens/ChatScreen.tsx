@@ -15,6 +15,7 @@ import { baseStyles, colors, glassCard } from '../theme';
 import { Bubble, formatStamp, type E2eeChat } from '../hooks/useE2eeChat';
 import { MessageBubble } from '../components/MessageBubble';
 import { Composer } from '../components/Composer';
+import { RelayStatus } from '../components/RelayStatus';
 import { editOutgoingBytes, sendOutgoingBytes } from '../services/chatPayload';
 
 interface Row {
@@ -106,6 +107,8 @@ export function ChatScreen({ chat }: Props) {
           </Text>
         </View>
       </View>
+
+      <RelayStatus bleed useRelay={chat.useRelay} transport={chat.transport} onToggle={chat.setUseRelay} />
 
       {notice ? <View style={styles.noticeBar}><Text style={styles.noticeText}>{notice}</Text></View> : null}
 

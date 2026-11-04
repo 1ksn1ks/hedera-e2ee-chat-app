@@ -12,6 +12,7 @@ import {
 } from 'react-native';
 import { baseStyles, colors, glassCard, radius } from '../theme';
 import type { E2eeChat } from '../hooks/useE2eeChat';
+import { RelayStatus } from '../components/RelayStatus';
 
 interface Props {
   chat: E2eeChat;
@@ -71,6 +72,8 @@ export function ConnectScreen({ chat }: Props) {
         Encrypted topic chat. Messages are sealed to the topic key — only
         holders of the topic private key can read them.
       </Text>
+
+      <RelayStatus useRelay={chat.useRelay} transport={chat.transport} onToggle={chat.setUseRelay} />
 
       <View style={[glassCard, styles.card]}>
         <Text style={styles.cardTitle}>Topic</Text>

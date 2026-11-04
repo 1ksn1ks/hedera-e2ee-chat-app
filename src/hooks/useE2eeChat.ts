@@ -8,15 +8,27 @@
 //   - wrong key / other payer / stale envelope → rejected;
 //   - the 18 KB HCS gate is measured on the final outgoing JSON.
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { AppState, type AppStateStatus } from 'react-native';
 import {
   AppMessage,
   fetchMessages,
   messageSig,
   reportPendingSend,
+  setBackendFailureHandler,
   streamOnReconnect,
   streamOnTopic,
   StreamEvent,
 } from '../services/backend';
+import { fetchMirrorMessages, startMirrorTail } from '../services/mirror';
+import { loadUseRelay, saveUseRelay } from '../services/relayPref';
+import {
+  chooseTransport,
+  shouldContactBackend,
+  shouldFallbackOnStreamError,
+  shouldReportSubmit,
+  type ActiveTransport,
+  type TransportMode,
+} from '../services/transport';
 import {
   editOutgoingBytes,
   HCS_MESSAGE_MAX_BYTES,
@@ -108,6 +120,11 @@ export function useE2eeChat() {
   const [account, setAccount] = useState<string | null>(null);
   const [walletBusy, setWalletBusy] = useState(false);
   const [pairingUri, setPairingUri] = useState<string | null>(null);
+  // TRANSPORT: "Use relay server" persists as useRelay. `transport` is the
+  // path actually in use (Relay vs Direct Hedera), which can fall back while
+  // the switch stays on.
+  const [useRelay, setUseRelayState] = useState(true);
+  const [transport, setTransport] = useState<ActiveTransport>('relay');
 
   // Secrets and maps live in refs: the topic key is in-memory only (its
   // persistent home is the keystore), never in React state or storage.
@@ -122,13 +139,42 @@ export function useE2eeChat() {
   const offStreamRef = useRef<(() => void) | null>(null);
   const offReconnectRef = useRef<(() => void) | null>(null);
   const accountRef = useRef<string | null>(null);
+  const modeRef = useRef<TransportMode>('relay');
+  const activeRef = useRef<ActiveTransport>('relay');
+  const seqRef = useRef(0);
+  const visibleRef = useRef(true);
+  const appStateRef = useRef<AppStateStatus>(AppState.currentState || 'active');
+  const mirrorCloseRef = useRef<(() => void) | null>(null);
+  const probeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const prefTouchedRef = useRef(false);
+  const prefReadyRef = useRef<Promise<void> | null>(null);
+  const goMirrorRef = useRef<(topic: string) => void>(() => {});
+  if (!prefReadyRef.current) {
+    // Start before paint so Connect awaits the saved switch. A later toggle
+    // sets prefTouchedRef and this result is ignored.
+    prefReadyRef.current = loadUseRelay()
+      .then((on) => {
+        if (prefTouchedRef.current) return;
+        setUseRelayState(on);
+        modeRef.current = on ? 'relay' : 'hedera-only';
+        if (!topicIdRef.current) {
+          const idle = on ? 'relay' : 'mirror';
+          activeRef.current = idle;
+          setTransport(idle);
+        }
+      })
+      .then(
+        () => undefined,
+        () => undefined
+      );
+  }
 
   const setAccountBoth = (acc: string | null) => {
     accountRef.current = acc;
     setAccount(acc);
   };
 
-  const stopLive = () => {
+  const stopRelayStream = () => {
     if (offStreamRef.current) {
       offStreamRef.current();
       offStreamRef.current = null;
@@ -138,6 +184,31 @@ export function useE2eeChat() {
       offReconnectRef.current = null;
     }
     liveReadyRef.current = false;
+  };
+
+  const stopMirrorTail = () => {
+    if (mirrorCloseRef.current) {
+      mirrorCloseRef.current();
+      mirrorCloseRef.current = null;
+    }
+  };
+
+  const stopProbe = () => {
+    if (probeTimerRef.current) {
+      clearTimeout(probeTimerRef.current);
+      probeTimerRef.current = null;
+    }
+  };
+
+  const stopLive = () => {
+    stopRelayStream();
+    stopMirrorTail();
+    stopProbe();
+  };
+
+  const refreshVisible = () => {
+    const docHidden = typeof document !== 'undefined' && document.visibilityState === 'hidden';
+    visibleRef.current = !docHidden && appStateRef.current !== 'background';
   };
 
   // ── Edit pipeline (port of rememberE2eeEdit) ──────────────────────────
@@ -193,6 +264,10 @@ export function useE2eeChat() {
   // are dropped silently.
   const ingest = useCallback(
     async (m: AppMessage) => {
+      if (!m.pending) {
+        const seq = Number(m.sequence_number);
+        if (Number.isFinite(seq) && seq > seqRef.current) seqRef.current = seq;
+      }
       if (m.editEncryptedMessage) {
         await rememberE2eeEdit(
           m.payer,
@@ -264,24 +339,44 @@ export function useE2eeChat() {
     [ingest]
   );
 
+  const absorb = useCallback(
+    async (messages: AppMessage[]) => {
+      for (const m of messages) {
+        const sig = messageSig(m);
+        if (seenRef.current.has(sig)) {
+          await ingest(m);
+          continue;
+        }
+        seenRef.current.add(sig);
+        await ingest(m);
+      }
+    },
+    [ingest]
+  );
+
   // Re-fetch anything missed while the stream was down (signature dedupe
-  // absorbs duplicates).
+  // absorbs duplicates). A failed relay read falls back to the mirror.
   const refetchMissed = useCallback(async () => {
     const topic = topicIdRef.current;
     if (!topic || !privateKeyRef.current) return;
+    if (!shouldContactBackend(modeRef.current)) return;
     const data = await fetchMessages(topic, 1000);
-    for (const m of data.messages) {
-      const sig = messageSig(m);
-      if (seenRef.current.has(sig)) continue;
-      seenRef.current.add(sig);
-      await ingest(m);
+    const next = chooseTransport(modeRef.current, {
+      ok: !data.failed,
+      ready: data.ready,
+      timedOut: data.timedOut,
+    });
+    if (next === 'mirror') {
+      goMirrorRef.current(topic);
+      return;
     }
-  }, [ingest]);
+    await absorb(data.messages);
+  }, [absorb]);
 
-  const startLive = useCallback(() => {
+  const startRelayStream = useCallback(() => {
     const topic = topicIdRef.current;
     if (!topic) return;
-    stopLive();
+    stopRelayStream();
     offStreamRef.current = streamOnTopic(topic, handleStream);
     offReconnectRef.current = streamOnReconnect(() => {
       if (!liveReadyRef.current) {
@@ -292,15 +387,124 @@ export function useE2eeChat() {
     });
   }, [handleStream, refetchMissed]);
 
+  const startMirror = useCallback(() => {
+    const topic = topicIdRef.current;
+    if (!topic) return;
+    stopMirrorTail();
+    const tail = startMirrorTail({
+      topicId: topic,
+      afterSeq: seqRef.current,
+      isVisible: () => visibleRef.current,
+      onAdvance: (lastSeq) => {
+        if (lastSeq > seqRef.current) seqRef.current = lastSeq;
+      },
+      onMessages: (messages) => {
+        void absorb(messages);
+      },
+    });
+    mirrorCloseRef.current = tail.close;
+  }, [absorb]);
+
+  // TRANSPORT: while the relay is down, ask again in the background and
+  // return to SSE once a read comes back ready.
+  const scheduleProbe = useCallback(() => {
+    if (probeTimerRef.current || modeRef.current !== 'relay') return;
+    probeTimerRef.current = setTimeout(() => {
+      probeTimerRef.current = null;
+      void (async () => {
+        if (modeRef.current !== 'relay' || activeRef.current !== 'mirror') return;
+        if (!visibleRef.current) {
+          scheduleProbe();
+          return;
+        }
+        const topic = topicIdRef.current;
+        if (!topic) return;
+        const data = await fetchMessages(topic, 100, seqRef.current);
+        if (modeRef.current !== 'relay' || activeRef.current !== 'mirror') return;
+        const next = chooseTransport('relay', {
+          ok: !data.failed,
+          ready: data.ready,
+          timedOut: data.timedOut,
+        });
+        if (next !== 'relay') {
+          scheduleProbe();
+          return;
+        }
+        await absorb(data.messages);
+        if (modeRef.current !== 'relay' || activeRef.current !== 'mirror') return;
+        activeRef.current = 'relay';
+        setTransport('relay');
+        stopMirrorTail();
+        startRelayStream();
+      })();
+    }, 12000);
+  }, [absorb, startRelayStream]);
+
+  const goMirror = useCallback(
+    (topic: string) => {
+      if (!topic) return;
+      activeRef.current = 'mirror';
+      setTransport('mirror');
+      stopRelayStream();
+      startMirror();
+      if (modeRef.current === 'relay') scheduleProbe();
+      else stopProbe();
+    },
+    [scheduleProbe, startMirror]
+  );
+  goMirrorRef.current = goMirror;
+
+  const startLive = useCallback(() => {
+    const topic = topicIdRef.current;
+    if (!topic) return;
+    if (modeRef.current === 'hedera-only' || activeRef.current === 'mirror') {
+      goMirror(topic);
+      return;
+    }
+    stopMirrorTail();
+    stopProbe();
+    activeRef.current = 'relay';
+    setTransport('relay');
+    startRelayStream();
+  }, [goMirror, startRelayStream]);
+
   // ── History load (unlock gate) ─────────────────────────────────────────
 
   const loadHistory = useCallback(
     async (topic: string): Promise<{ meta: TopicMeta; bubbles: Bubble[] }> => {
-      const data = await fetchMessages(topic, 1000);
-      if (!data.ready) {
-        throw new Error('Topic not available yet (backend offline or not backfilled)');
+      // TRANSPORT: relay first unless the switch is off. A failed, timed-out,
+      // or ready=false read loads the same history from the public mirror.
+      let messages: AppMessage[];
+      if (!shouldContactBackend(modeRef.current)) {
+        const page = await fetchMirrorMessages(topic, 0);
+        seqRef.current = page.lastSeq;
+        activeRef.current = 'mirror';
+        setTransport('mirror');
+        messages = page.messages;
+      } else {
+        const data = await fetchMessages(topic, 1000);
+        const next = chooseTransport(modeRef.current, {
+          ok: !data.failed,
+          ready: data.ready,
+          timedOut: data.timedOut,
+        });
+        if (next === 'relay') {
+          let maxSeq = 0;
+          for (const row of data.messages) {
+            if (!row.pending && Number(row.sequence_number) > maxSeq) maxSeq = Number(row.sequence_number);
+          }
+          seqRef.current = maxSeq;
+          activeRef.current = 'relay';
+          setTransport('relay');
+          messages = data.messages;
+        } else {
+          const page = await fetchMirrorMessages(topic, 0);
+          seqRef.current = page.lastSeq;
+          activeRef.current = 'mirror';
+          setTransport('mirror');
+          messages = page.messages;
+        }
       }
-      const messages = data.messages;
 
       // Key discovery, same scan the Globe map does: newest first.
       let publicKeyHex: string | null = null;
@@ -393,7 +597,9 @@ export function useE2eeChat() {
       setPairingUri(null);
       seenRef.current = new Set();
       editsRef.current = new Map();
+      seqRef.current = 0;
       stopLive();
+      await prefReadyRef.current;
       setUnlock({ status: 'connecting', message: '' });
       topicIdRef.current = topic;
       try {
@@ -484,7 +690,11 @@ export function useE2eeChat() {
           pending: true,
         };
         seenRef.current.add(messageSig(local));
-        void reportPendingSend(topic, outgoing, acc);
+        if (shouldReportSubmit(modeRef.current, activeRef.current)) {
+          void reportPendingSend(topic, outgoing, acc).then((ok) => {
+            if (!ok) goMirrorRef.current(topic);
+          });
+        }
         await ingest(local);
         return { ok: true };
       } catch (e: any) {
@@ -525,7 +735,11 @@ export function useE2eeChat() {
         }
         await sendTopicMessage(topic, outgoing);
         setAccountBoth(acc);
-        void reportPendingSend(topic, outgoing, acc);
+        if (shouldReportSubmit(modeRef.current, activeRef.current)) {
+          void reportPendingSend(topic, outgoing, acc).then((ok) => {
+            if (!ok) goMirrorRef.current(topic);
+          });
+        }
         // Apply locally right away; the topic stream confirms the same edit.
         await rememberE2eeEdit(acc, body, new Date().toISOString());
         return { ok: true };
@@ -566,10 +780,80 @@ export function useE2eeChat() {
     privateKeyRef.current = null;
     publicKeyRef.current = null;
     pinnedRef.current = null;
+    seqRef.current = 0;
+    const idle = modeRef.current === 'relay' ? 'relay' : 'mirror';
+    activeRef.current = idle;
+    setTransport(idle);
     setMeta(null);
     setBubbles([]);
     setUnlock({ status: 'none', message: '' });
     setPhase('idle');
+  }, []);
+
+  const setUseRelay = useCallback(
+    (on: boolean) => {
+      prefTouchedRef.current = true;
+      setUseRelayState(on);
+      modeRef.current = on ? 'relay' : 'hedera-only';
+      void saveUseRelay(on);
+      const topic = topicIdRef.current;
+      if (!topic || !privateKeyRef.current) {
+        const idle = on ? 'relay' : 'mirror';
+        activeRef.current = idle;
+        setTransport(idle);
+        return;
+      }
+      if (!on) {
+        goMirror(topic);
+        return;
+      }
+      void (async () => {
+        const data = await fetchMessages(topic, 100, seqRef.current);
+        if (modeRef.current !== 'relay') return;
+        const next = chooseTransport('relay', {
+          ok: !data.failed,
+          ready: data.ready,
+          timedOut: data.timedOut,
+        });
+        if (next === 'mirror') {
+          goMirror(topic);
+          return;
+        }
+        await absorb(data.messages);
+        if (modeRef.current !== 'relay') return;
+        activeRef.current = 'relay';
+        setTransport('relay');
+        stopMirrorTail();
+        stopProbe();
+        startRelayStream();
+      })();
+    },
+    [absorb, goMirror, startRelayStream]
+  );
+
+  useEffect(() => {
+    refreshVisible();
+    const onVis = () => refreshVisible();
+    if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVis);
+    const sub = AppState.addEventListener('change', (state) => {
+      appStateRef.current = state;
+      refreshVisible();
+    });
+    return () => {
+      if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVis);
+      sub.remove();
+    };
+  }, []);
+
+  useEffect(() => {
+    setBackendFailureHandler(() => {
+      if (!shouldFallbackOnStreamError(modeRef.current, activeRef.current)) return false;
+      const topic = topicIdRef.current;
+      if (!topic) return false;
+      goMirrorRef.current(topic);
+      return true;
+    });
+    return () => setBackendFailureHandler(null);
   }, []);
 
   useEffect(() => () => stopLive(), []);
@@ -591,6 +875,9 @@ export function useE2eeChat() {
     walletConnect,
     walletDisconnect,
     formatStamp,
+    useRelay,
+    transport,
+    setUseRelay,
   };
 }
 

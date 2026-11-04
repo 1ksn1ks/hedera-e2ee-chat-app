@@ -5,5 +5,5 @@
     "lib": ["es2020", "dom"]
   },
   "include": ["**/*.ts", "**/*.tsx"],
-  "exclude": ["**/node_modules", "**/Pods", "android", "ios"]
+  "exclude": ["**/node_modules", "**/Pods", "android", "ios", "**/*.test.ts"]
 }

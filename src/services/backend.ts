@@ -3,11 +3,36 @@
 // wallet-confirmed sends reported via POST /api/submit so every viewer sees
 // them instantly as pending.
 //
-// Same-origin by design: the dev preview and the production reverse proxy
-// forward /api/* to the backend, so no URL is hardcoded and there is no
-// CORS to fight. Set BACKEND_URL only if the app is hosted away from it.
-export const BACKEND_URL =
-  (globalThis as { __E2EE_BACKEND_URL__?: string }).__E2EE_BACKEND_URL__ || '';
+// Globe keeps BACKEND_URL = "" (msgbackend.js:13) so the page calls its own
+// origin. That origin in production is https://onlyonhbar.com (placeurl.js:45).
+// Dev and the production reverse proxy forward /api to the topic backend
+// (msgbackend.js:10-12, step_by_step/vite.config.js /api proxy).
+// These routes already exist and take this app's bodies:
+//   GET  /api/messages  server/index.js:3279  { ready, messages }
+//   GET  /api/stream    server/index.js:3334  text/event-stream
+//   POST /api/submit    server/index.js:3076  { topic, body, payer }
+// CORS is app-wide at server/index.js:1734-1739 (Allow-Origin *, methods
+// GET,POST,OPTIONS, header Content-Type, OPTIONS → 204). The SSE writeHead
+// at server/index.js:3339 does not replace those headers. A browser on
+// another origin is allowed through. Live responses from
+// https://onlyonhbar.com on 2026-11-04 carried Access-Control-Allow-Origin *.
+//
+// This app is not served from that origin, so the default base is the
+// production origin. Set globalThis.__E2EE_BACKEND_URL__ to override it
+// ("" keeps same-origin, which the Vite preview proxies to :8787).
+export const GLOBE_PRODUCTION_ORIGIN = 'https://onlyonhbar.com';
+
+// Relay reads and the pending report abort after this. A timeout is a
+// failed read and the chat falls back to the mirror.
+export const BACKEND_TIMEOUT_MS = 4000;
+
+function readBackendUrl(): string {
+  const configured = (globalThis as { __E2EE_BACKEND_URL__?: string }).__E2EE_BACKEND_URL__;
+  if (typeof configured === 'string') return configured.replace(/\/+$/, '');
+  return GLOBE_PRODUCTION_ORIGIN;
+}
+
+export const BACKEND_URL = readBackendUrl();
 
 // One backend row, already in the app shape the Globe map consumes:
 // the parsed body's fields spread first, then the envelope.
@@ -23,24 +48,54 @@ export interface AppMessage {
 export interface MessagesResponse {
   ready: boolean;
   messages: AppMessage[];
+  // Network error, non-2xx, or a body that is not JSON.
+  failed: boolean;
+  // The ~4s abort fired. Also a failure.
+  timedOut: boolean;
+}
+
+function failedRead(timedOut: boolean): MessagesResponse {
+  return { ready: false, messages: [], failed: true, timedOut };
+}
+
+async function fetchWithTimeout(url: string, init: RequestInit = {}): Promise<Response> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), BACKEND_TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...init, signal: ctrl.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function isTimeout(err: unknown): boolean {
+  const name = err && typeof err === 'object' && 'name' in err ? String((err as { name?: string }).name) : '';
+  return name === 'AbortError' || name === 'TimeoutError';
 }
 
 // ready=false → backend offline or topic not backfilled yet.
+// A timeout, network error, or HTTP error is failed (the caller falls back).
 export async function fetchMessages(
   topicId: string,
   limit = 1000,
   afterSeq = 0
 ): Promise<MessagesResponse> {
   const after = afterSeq > 0 ? `&after_seq=${Math.floor(afterSeq)}` : '';
-  const res = await fetch(
-    `${BACKEND_URL}/api/messages?topic=${encodeURIComponent(topicId)}&limit=${limit}${after}`
-  );
-  if (!res.ok) return { ready: false, messages: [] };
-  const data = await res.json();
-  return {
-    ready: !!data.ready,
-    messages: Array.isArray(data.messages) ? data.messages : [],
-  };
+  try {
+    const res = await fetchWithTimeout(
+      `${BACKEND_URL}/api/messages?topic=${encodeURIComponent(topicId)}&limit=${limit}${after}`
+    );
+    if (!res.ok) return failedRead(false);
+    const data = await res.json();
+    return {
+      ready: !!data.ready,
+      messages: Array.isArray(data.messages) ? data.messages : [],
+      failed: false,
+      timedOut: false,
+    };
+  } catch (err) {
+    return failedRead(isTimeout(err));
+  }
 }
 
 // Stable identity of one chat message: the pending form and the confirmed
@@ -75,6 +130,15 @@ const STREAM_REOPEN_JITTER_MS = 25000;
 const POLL_FALLBACK_MS = 3000;
 
 let source: EventSource | null = null;
+
+// TRANSPORT: the chat hook registers this. A closed SSE connection asks the
+// hook whether it took over (mirror fallback). True skips the relay reopen.
+type BackendFailureHandler = (reason: string) => boolean;
+let onBackendFailure: BackendFailureHandler | null = null;
+
+export function setBackendFailureHandler(handler: BackendFailureHandler | null): void {
+  onBackendFailure = handler;
+}
 let pollTimer: ReturnType<typeof setTimeout> | null = null;
 let pollSeq = 0;
 let pollSeen = new Set<string>();
@@ -125,6 +189,12 @@ function openSource(): void {
     if (s.readyState !== 2 /* CLOSED */) return;
     if (source !== s) return;
     source = null;
+    try {
+      s.close();
+    } catch {
+      /* already closed */
+    }
+    if (onBackendFailure && onBackendFailure('stream')) return;
     setTimeout(openSource, STREAM_REOPEN_MS + Math.random() * STREAM_REOPEN_JITTER_MS);
   };
 }
@@ -135,6 +205,12 @@ function startPolling(): void {
     if (pollTimer === null) return;
     try {
       const data = await fetchMessages(topicList().split(',')[0], 100, pollSeq);
+      if (data.failed || data.timedOut || !data.ready) {
+        if (onBackendFailure && onBackendFailure('poll')) {
+          stopPolling();
+          return;
+        }
+      }
       for (const m of data.messages) {
         const sig = messageSig(m);
         if (pollSeen.has(sig)) continue;
@@ -242,18 +318,21 @@ export function streamOnReconnect(fn: () => void): () => void {
 // A wallet-confirmed send is reported as PENDING so every viewer sees the
 // message instantly; the backend's mirror poller confirms it. The mirror
 // (source of truth) still has the message if the backend is offline.
+// Returns false when the relay did not accept the report (timeout, network,
+// or non-2xx). The Hedera submit has already happened either way.
 export async function reportPendingSend(
   topicId: string,
   body: string,
   payer: string
-): Promise<void> {
+): Promise<boolean> {
   try {
-    await fetch(`${BACKEND_URL}/api/submit`, {
+    const res = await fetchWithTimeout(`${BACKEND_URL}/api/submit`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ topic: topicId, body, payer }),
     });
+    return res.ok;
   } catch {
-    // backend offline — the mirror still has the message
+    return false;
   }
 }
