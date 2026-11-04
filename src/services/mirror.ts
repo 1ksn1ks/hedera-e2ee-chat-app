@@ -11,7 +11,12 @@ export const MIRROR_ORIGIN = 'https://mainnet-public.mirrornode.hedera.com';
 export const MIRROR_POLL_MS = 3000;
 
 const PAGE_LIMIT = 100;
-const MAX_PAGES = 30;
+// History is the newest window only. Walking order=asc from sequence 0
+// and stopping after a few dozen pages hides the latest messages.
+const HISTORY_MAX_PAGES = 10;
+// The live tail starts at the highest sequence already shown and only
+// asks for rows after that, so a long catch-up is rare.
+const TAIL_MAX_PAGES = 30;
 const HCS_MAX_CHUNKS = 20;
 
 export interface MirrorChunkInfo {
@@ -50,8 +55,16 @@ export interface ChunkAssembler {
   pendingSequences(topicId: string): number[];
 }
 
-// gt:0 is a 400 on the public mirror (confirmed 2026-11-04). The first page
-// is order=asc with no sequence filter. Later pages use sequencenumber=gt:{n}.
+// Newest page of history. Further pages follow the mirror's links.next.
+export function mirrorHistoryUrl(topicId: string): string {
+  return (
+    `${MIRROR_ORIGIN}/api/v1/topics/${encodeURIComponent(topicId)}` +
+    `/messages?limit=${PAGE_LIMIT}&order=desc`
+  );
+}
+
+// Live tail. gt:0 is a 400 on the public mirror, so a cursor of 0 omits the
+// sequence filter. Every later poll is sequencenumber=gt:{n}&order=asc.
 export function mirrorMessagesUrl(topicId: string, afterSeq: number): string {
   const after = Math.floor(Number(afterSeq) || 0);
   const filter = after > 0 ? `&sequencenumber=gt:${after}` : '';
@@ -59,6 +72,20 @@ export function mirrorMessagesUrl(topicId: string, afterSeq: number): string {
     `${MIRROR_ORIGIN}/api/v1/topics/${encodeURIComponent(topicId)}` +
     `/messages?limit=${PAGE_LIMIT}&order=asc${filter}`
   );
+}
+
+function resolveMirrorUrl(next: string): string {
+  if (/^https?:\/\//i.test(next)) return next;
+  return new URL(next, MIRROR_ORIGIN).toString();
+}
+
+export function highestSequence(rows: MirrorRow[]): number {
+  let max = 0;
+  for (const row of rows) {
+    const seq = Number(row && row.sequence_number);
+    if (Number.isFinite(seq) && seq > max) max = seq;
+  }
+  return max;
 }
 
 function decodeBase64(value: string): Uint8Array {
@@ -271,6 +298,30 @@ export function mapMirrorRows(
   return { messages, lastSeq };
 }
 
+// Newest HISTORY_MAX_PAGES pages (order=desc), reversed into chronological
+// order for display. Chunk joining and the payer check run on that
+// chronological order. The tail cursor is the highest sequence seen, not
+// the oldest row in the window.
+export async function fetchMirrorHistory(
+  topicId: string,
+  fetchImpl: typeof fetch = fetch
+): Promise<MappedMirrorPage> {
+  const rows: MirrorRow[] = [];
+  let url: string | null = mirrorHistoryUrl(topicId);
+  for (let page = 0; page < HISTORY_MAX_PAGES && url; page++) {
+    const res = await fetchImpl(url);
+    if (!res.ok) throw new Error('mirror HTTP ' + res.status);
+    const data = (await res.json()) as { messages?: MirrorRow[]; links?: { next?: string | null } };
+    const batch = Array.isArray(data.messages) ? data.messages : [];
+    rows.push(...batch);
+    const next = data.links && typeof data.links.next === 'string' ? data.links.next : '';
+    if (!next || batch.length === 0) break;
+    url = resolveMirrorUrl(next);
+  }
+  const mapped = mapMirrorRows(topicId, rows.slice().reverse(), 0);
+  return { messages: mapped.messages, lastSeq: highestSequence(rows) };
+}
+
 export async function fetchMirrorMessages(
   topicId: string,
   afterSeq = 0,
@@ -279,7 +330,7 @@ export async function fetchMirrorMessages(
   const assembler = createChunkAssembler();
   let seq = Math.max(0, Math.floor(Number(afterSeq) || 0));
   const messages: AppMessage[] = [];
-  for (let page = 0; page < MAX_PAGES; page++) {
+  for (let page = 0; page < TAIL_MAX_PAGES; page++) {
     const res = await fetchImpl(mirrorMessagesUrl(topicId, seq));
     if (!res.ok) throw new Error('mirror HTTP ' + res.status);
     const data = (await res.json()) as { messages?: MirrorRow[]; links?: { next?: string | null } };

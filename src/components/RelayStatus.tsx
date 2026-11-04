@@ -17,23 +17,24 @@ interface Props {
 export function RelayStatus({ useRelay, transport, onToggle, bleed }: Props) {
   const direct = transport !== 'relay';
   return (
-    <View style={[glassCard, styles.row, bleed ? styles.bleed : null]}>
-      <Pressable
-        onPress={() => onToggle(!useRelay)}
-        accessibilityRole="switch"
-        accessibilityState={{ checked: useRelay }}
-        accessibilityLabel="Use relay server (faster, live)"
-        style={styles.toggle}
-      >
+    <Pressable
+      onPress={() => onToggle(!useRelay)}
+      accessibilityRole="switch"
+      accessibilityState={{ checked: useRelay }}
+      accessibilityLabel="Use relay server (faster, live)"
+      hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+      style={[glassCard, styles.row, bleed ? styles.bleed : null]}
+    >
+      <View style={styles.toggle}>
         <View style={[styles.track, useRelay ? styles.trackOn : styles.trackOff]}>
           <View style={[styles.thumb, useRelay ? styles.thumbOn : styles.thumbOff]} />
         </View>
         <Text style={styles.label}>Use relay server (faster, live)</Text>
-      </Pressable>
+      </View>
       <View style={[baseStyles.chip, styles.chip]}>
         <Text style={baseStyles.chipText}>{direct ? 'Direct Hedera' : 'Relay'}</Text>
       </View>
-    </View>
+    </Pressable>
   );
 }
 
@@ -44,6 +45,7 @@ const styles = StyleSheet.create({
     gap: 8,
     paddingHorizontal: 10,
     paddingVertical: 8,
+    minHeight: 44,
   },
   bleed: {
     borderRadius: 0,

@@ -19,7 +19,7 @@ import {
   streamOnTopic,
   StreamEvent,
 } from '../services/backend';
-import { fetchMirrorMessages, startMirrorTail } from '../services/mirror';
+import { fetchMirrorHistory, startMirrorTail } from '../services/mirror';
 import { loadUseRelay, saveUseRelay } from '../services/relayPref';
 import {
   chooseTransport,
@@ -476,7 +476,7 @@ export function useE2eeChat() {
       // or ready=false read loads the same history from the public mirror.
       let messages: AppMessage[];
       if (!shouldContactBackend(modeRef.current)) {
-        const page = await fetchMirrorMessages(topic, 0);
+        const page = await fetchMirrorHistory(topic);
         seqRef.current = page.lastSeq;
         activeRef.current = 'mirror';
         setTransport('mirror');
@@ -498,7 +498,7 @@ export function useE2eeChat() {
           setTransport('relay');
           messages = data.messages;
         } else {
-          const page = await fetchMirrorMessages(topic, 0);
+          const page = await fetchMirrorHistory(topic);
           seqRef.current = page.lastSeq;
           activeRef.current = 'mirror';
           setTransport('mirror');

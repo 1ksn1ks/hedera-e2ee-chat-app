@@ -2,7 +2,9 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   createChunkAssembler,
+  fetchMirrorHistory,
   mapMirrorRows,
+  mirrorHistoryUrl,
   mirrorMessagesUrl,
   startMirrorTail,
   type MirrorRow,
@@ -130,13 +132,100 @@ test('skips non-JSON and a chunk whose payer is not the initial account', () => 
   assert.equal(createChunkAssembler().pendingSequences(TOPIC).length, 0);
 });
 
-test('first mirror page omits sequencenumber=gt:0 and later pages send gt:{n}', () => {
-  const first = mirrorMessagesUrl(TOPIC, 0);
-  assert.match(first, /^https:\/\/mainnet-public\.mirrornode\.hedera\.com\/api\/v1\/topics\/0\.0\.42\/messages\?/);
-  assert.match(first, /order=asc/);
-  assert.equal(first.includes('sequencenumber='), false);
-  const next = mirrorMessagesUrl('0.0.42', 5);
-  assert.match(next, /sequencenumber=gt:5$/);
+test('history is newest-first and the tail is sequencenumber=gt:{n} order=asc', () => {
+  const history = mirrorHistoryUrl(TOPIC);
+  assert.match(history, /^https:\/\/mainnet-public\.mirrornode\.hedera\.com\/api\/v1\/topics\/0\.0\.42\/messages\?/);
+  assert.match(history, /limit=100/);
+  assert.match(history, /order=desc/);
+  assert.equal(history.includes('sequencenumber='), false);
+
+  const tailStart = mirrorMessagesUrl(TOPIC, 0);
+  assert.match(tailStart, /order=asc/);
+  assert.equal(tailStart.includes('sequencenumber='), false);
+  const tail = mirrorMessagesUrl('0.0.42', 5);
+  assert.match(tail, /order=asc/);
+  assert.match(tail, /sequencenumber=gt:5$/);
+});
+
+function jsonResponse(body: unknown): Response {
+  return { ok: true, json: async () => body } as Response;
+}
+
+test('history reverses desc pages, keeps chunks and the payer check, and seeds the highest sequence', async () => {
+  const text = '{"encryptedMessage":{"ciphertext":"hello"}}';
+  const bytes = Buffer.from(text, 'utf8');
+  const mid = 10;
+  const part = (start: number, end: number) => Buffer.from(bytes.subarray(start, end)).toString('base64');
+  const id = {
+    account_id: '0.0.5',
+    nonce: 0,
+    scheduled: false,
+    transaction_valid_start: '1700000000.070836376',
+  };
+  const chunk = (number: number, total: number, seq: number, message: string): MirrorRow => ({
+    consensus_timestamp: '1700000000.000000000',
+    message,
+    payer_account_id: '0.0.5',
+    sequence_number: seq,
+    chunk_info: { number, total, initial_transaction_id: id },
+  });
+  const newer: { messages: MirrorRow[]; links: { next: string | null } } = {
+    messages: [
+      plain({ encryptedMessage: { ciphertext: 'new' } }, 9),
+      chunk(2, 2, 8, part(mid, bytes.length)),
+      {
+        consensus_timestamp: '1700000000.000000000',
+        message: b64('{"encryptedMessage":{"ciphertext":"no"}}'),
+        payer_account_id: '0.0.9',
+        sequence_number: 7,
+        chunk_info: {
+          number: 1,
+          total: 1,
+          initial_transaction_id: {
+            account_id: '0.0.5',
+            nonce: 0,
+            scheduled: false,
+            transaction_valid_start: '1.0',
+          },
+        },
+      },
+    ],
+    links: { next: '/api/v1/topics/0.0.42/messages?limit=100&order=desc&sequencenumber=lt:7' },
+  };
+  const older = {
+    messages: [chunk(1, 2, 6, part(0, mid)), plain({ encryptedMessage: { ciphertext: 'old' } }, 4)],
+    links: { next: null },
+  };
+  const urls: string[] = [];
+  const page = await fetchMirrorHistory(TOPIC, async (url) => {
+    urls.push(url);
+    return jsonResponse(urls.length === 1 ? newer : older);
+  });
+  assert.match(urls[0], /order=desc/);
+  assert.match(urls[1], /sequencenumber=lt:7/);
+  assert.deepEqual(
+    page.messages.map((message) => message.sequence_number),
+    [4, 6, 9]
+  );
+  assert.deepEqual(page.messages[1].encryptedMessage, { ciphertext: 'hello' });
+  assert.equal(page.messages.some((message) => message.sequence_number === 7), false);
+  assert.equal(page.lastSeq, 9);
+});
+
+test('history stops after 10 pages', async () => {
+  let calls = 0;
+  const page = await fetchMirrorHistory(TOPIC, async () => {
+    calls += 1;
+    const seq = 1000 - calls;
+    return jsonResponse({
+      messages: [plain({ encryptedMessage: { ciphertext: String(seq) } }, seq)],
+      links: { next: '/api/v1/topics/0.0.42/messages?limit=100&order=desc&sequencenumber=lt:' + seq },
+    });
+  });
+  assert.equal(calls, 10);
+  assert.equal(page.lastSeq, 999);
+  assert.equal(page.messages[0].sequence_number, 990);
+  assert.equal(page.messages[page.messages.length - 1].sequence_number, 999);
 });
 
 test('mirror tail pauses while hidden and polls while visible', async () => {
