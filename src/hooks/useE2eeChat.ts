@@ -45,6 +45,7 @@ import {
   parsePrivateKey,
   parsePublicKey,
 } from '../services/sodium';
+import { releaseHeldMedia } from '../services/mediaCrypto';
 import { loadTopicKey, storeTopicKey } from '../services/secretStore';
 import { connectWallet, disconnectWallet, getConnectedAccount, sendTopicMessage } from '../services/wallet';
 
@@ -54,6 +55,8 @@ export interface Bubble {
   created: string; // ISO (provisional = submit time while pending)
   text: string;
   image: string;
+  poster: string;
+  legacyPlain: boolean;
   pending: boolean;
   edited: boolean;
   mine: boolean;
@@ -62,6 +65,8 @@ export interface Bubble {
 interface EditEntry {
   text: string;
   image: string;
+  poster: string;
+  legacyPlain: boolean;
   at: string;
 }
 
@@ -107,6 +112,7 @@ function createdIso(value: unknown): string {
 interface Result {
   ok: boolean;
   error?: string;
+  droppedPoster?: boolean;
 }
 
 export function useE2eeChat() {
@@ -231,7 +237,12 @@ export function useE2eeChat() {
         return null; // no key for this topic / malformed ciphertext: reject
       }
       const text = typeof parts.text === 'string' ? parts.text : '';
-      const image = data.image ? String(data.image) : parts.image || '';
+      // The image rides inside the sealed payload. data.image is only a
+      // fallback for edits that were already sent the old way
+      // (encryptedtopicchat.js:71-73).
+      const image = parts.image || (data.image ? String(data.image) : '');
+      const poster = parts.poster || '';
+      const legacyPlain = !!image && !poster;
       if (!text && !image) return null;
       const at = createdIso(envelope) || '';
       // An edit that names a bubble from its own future is malformed noise.
@@ -242,13 +253,13 @@ export function useE2eeChat() {
       if (!at && prev) return null;
       // Latest wins: an older edit arriving late never replaces a newer one.
       if (prev && prev.at && at && at < prev.at) return null;
-      const entry: EditEntry = { text, image, at };
+      const entry: EditEntry = { text, image, poster, legacyPlain, at };
       editsRef.current.set(mapKey, entry);
       // Rewrite the on-screen bubbles in place (+ the "edited" mark).
       setBubbles((bs) =>
         bs.map((b) =>
           b.payer === payer && b.created === created
-            ? { ...b, text, image, edited: true }
+            ? { ...b, text, image, poster, legacyPlain, edited: true }
             : b
         )
       );
@@ -304,6 +315,8 @@ export function useE2eeChat() {
             ...next[i],
             text: parts.text,
             image: parts.image,
+            poster: parts.poster,
+            legacyPlain: parts.legacyPlain,
             pending: isPending,
             created: isPending ? next[i].created : created,
             mine,
@@ -313,7 +326,18 @@ export function useE2eeChat() {
         }
         return [
           ...bs,
-          { sig, payer: m.payer, created, text: parts.text, image: parts.image, pending: isPending, edited, mine },
+          {
+            sig,
+            payer: m.payer,
+            created,
+            text: parts.text,
+            image: parts.image,
+            poster: parts.poster,
+            legacyPlain: parts.legacyPlain,
+            pending: isPending,
+            edited,
+            mine,
+          },
         ];
       });
     },
@@ -654,7 +678,7 @@ export function useE2eeChat() {
   // ── Send + edit (wallet-confirmed, 18 KB gated) ────────────────────────
 
   const send = useCallback(
-    async (text: string, imageUrl = ''): Promise<Result> => {
+    async (text: string, imageUrl = '', poster = ''): Promise<Result> => {
       const topic = topicIdRef.current;
       const pub = publicKeyRef.current;
       if (!topic) return { ok: false, error: 'No topic connected' };
@@ -663,13 +687,22 @@ export function useE2eeChat() {
       }
       const acc = (await getConnectedAccount()) || accountRef.current;
       if (!acc) return { ok: false, error: 'Connect a wallet to send (HBAR network fee only)' };
+      if (!String(text || '').trim() && !imageUrl) return { ok: false, error: 'Please enter a message.' };
       // Predict the exact outgoing size before encrypting (fixed 48-byte
-      // seal, unpadded base64).
-      const predicted = sendOutgoingBytes(text, imageUrl);
+      // seal, unpadded base64). A still that does not fit is dropped, the
+      // same as encryptedtopicchat.js:1311-1314.
+      let still = poster;
+      let droppedPoster = false;
+      let predicted = sendOutgoingBytes(text, imageUrl, still);
+      if (still && predicted > HCS_MESSAGE_MAX_BYTES) {
+        still = '';
+        droppedPoster = true;
+        predicted = sendOutgoingBytes(text, imageUrl, still);
+      }
       if (predicted > HCS_MESSAGE_MAX_BYTES) return { ok: false, error: HCS_TOO_LONG };
       try {
         // Encrypt before build: plaintext never enters the HCS JSON.
-        const encryptedMessage = await encryptMessage(packChatPayload(text, imageUrl), pub);
+        const encryptedMessage = await encryptMessage(packChatPayload(text, imageUrl, still), pub);
         const outgoing = JSON.stringify({ encryptedMessage });
         // And measure the final JSON anyway — the ciphertext is the exact
         // length, so this can only ever disagree on a bug.
@@ -696,7 +729,7 @@ export function useE2eeChat() {
           });
         }
         await ingest(local);
-        return { ok: true };
+        return { ok: true, droppedPoster };
       } catch (e: any) {
         return { ok: false, error: e?.message || 'Send failed' };
       }
@@ -719,10 +752,18 @@ export function useE2eeChat() {
         timestamp: formatStamp(bubble.created),
       };
       if (bubble.image) data.image = bubble.image;
-      const predicted = editOutgoingBytes(data, newText, bubble.image);
+      const image = bubble.image || '';
+      let still = bubble.poster || '';
+      let droppedPoster = false;
+      let predicted = editOutgoingBytes(data, newText, image, still);
+      if (still && predicted > HCS_MESSAGE_MAX_BYTES) {
+        still = '';
+        droppedPoster = true;
+        predicted = editOutgoingBytes(data, newText, image, still);
+      }
       if (predicted > HCS_MESSAGE_MAX_BYTES) return { ok: false, error: HCS_TOO_LONG };
       try {
-        const encryptedMessage = await encryptMessage(packChatPayload(newText, bubble.image), pub);
+        const encryptedMessage = await encryptMessage(packChatPayload(newText, image, still), pub);
         const body: Record<string, unknown> = {
           created: data.created,
           timestamp: data.timestamp,
@@ -742,7 +783,7 @@ export function useE2eeChat() {
         }
         // Apply locally right away; the topic stream confirms the same edit.
         await rememberE2eeEdit(acc, body, new Date().toISOString());
-        return { ok: true };
+        return { ok: true, droppedPoster };
       } catch (e: any) {
         return { ok: false, error: e?.message || 'Edit was not saved' };
       }
@@ -768,6 +809,7 @@ export function useE2eeChat() {
 
   const walletDisconnect = useCallback(async () => {
     await disconnectWallet();
+    releaseHeldMedia();
     setAccountBoth(null);
     setPairingUri(null);
   }, []);
@@ -776,6 +818,7 @@ export function useE2eeChat() {
 
   const leave = useCallback(() => {
     stopLive();
+    releaseHeldMedia();
     topicIdRef.current = null;
     privateKeyRef.current = null;
     publicKeyRef.current = null;

@@ -6,6 +6,7 @@
 import React, { useState } from 'react';
 import {
   Image,
+  Linking,
   Pressable,
   StyleSheet,
   Text,
@@ -14,6 +15,7 @@ import {
 } from 'react-native';
 import { colors, glassCard, radius } from '../theme';
 import { Bubble } from '../hooks/useE2eeChat';
+import { isVideoUrl } from '../services/mediaCrypto';
 
 const AVATAR = 'https://kiloscribe.com/api/inscription-cdn/0.0.4819119';
 
@@ -24,6 +26,102 @@ interface Props {
   stamp: string;
   canEdit: boolean;
   onEdit: (bubble: Bubble) => void;
+}
+
+// LOGIC CHANGE. The picture is the sealed media from unpackChatPayload.
+// A video shows the sealed still (`p`) and a cyan play control. A plain
+// {t, i} link is labeled "unencrypted (old)". A still that fails to open
+// shows "can't decrypt". The chrome stays the cyan glass bubble.
+function MediaFrame({ bubble }: { bubble: Bubble }) {
+  const [failed, setFailed] = useState(false);
+  const [playing, setPlaying] = useState(false);
+  if (!bubble.image && !bubble.poster) return null;
+  const video = isVideoUrl(bubble.image);
+  const legacy = bubble.legacyPlain ? <Text style={styles.legacy}>unencrypted (old)</Text> : null;
+  if (failed) {
+    return (
+      <View style={styles.failBox}>
+        <Text style={styles.fail}>can't decrypt</Text>
+        {legacy}
+      </View>
+    );
+  }
+  if (video && playing && bubble.image) {
+    return (
+      <View style={styles.mediaWrap}>
+        <Playable uri={bubble.image} poster={bubble.poster} onError={() => setFailed(true)} />
+        {legacy}
+      </View>
+    );
+  }
+  if (video) {
+    return (
+      <View>
+        <View style={styles.mediaWrap}>
+          {bubble.poster ? (
+            <Image
+              source={{ uri: bubble.poster }}
+              style={styles.image}
+              resizeMode="cover"
+              onError={() => setFailed(true)}
+            />
+          ) : (
+            <View style={[styles.image, styles.posterEmpty]} />
+          )}
+          <View style={styles.playOverlay} pointerEvents="box-none">
+            <Pressable
+              onPress={() => setPlaying(true)}
+              style={styles.play}
+              accessibilityRole="button"
+              accessibilityLabel="Play video"
+              hitSlop={8}
+            >
+              <View style={styles.playTriangle} />
+            </Pressable>
+          </View>
+        </View>
+        {legacy}
+      </View>
+    );
+  }
+  const still = bubble.image || bubble.poster;
+  return (
+    <View>
+      <Image
+        source={{ uri: still }}
+        style={styles.image}
+        resizeMode="cover"
+        onError={() => setFailed(true)}
+      />
+      {legacy}
+    </View>
+  );
+}
+
+function Playable({ uri, poster, onError }: { uri: string; poster: string; onError: () => void }) {
+  if (typeof document === 'undefined') {
+    return (
+      <Pressable onPress={() => Linking.openURL(uri)} style={styles.failBox} accessibilityRole="button">
+        <Text style={styles.fail}>Play</Text>
+      </Pressable>
+    );
+  }
+  return React.createElement('video' as unknown as 'div', {
+    src: uri,
+    poster: poster || undefined,
+    controls: true,
+    playsInline: true,
+    autoPlay: true,
+    onError,
+    style: {
+      width: 240,
+      height: 160,
+      borderRadius: 8,
+      marginTop: 6,
+      backgroundColor: colors.bg,
+      objectFit: 'cover',
+    },
+  });
 }
 
 export function MessageBubble({ bubble, showAvatar, showHeader, stamp, canEdit, onEdit }: Props) {
@@ -77,9 +175,7 @@ export function MessageBubble({ bubble, showAvatar, showHeader, stamp, canEdit, 
               {expanded ? bubble.text : long ? bubble.text.slice(0, 400) : bubble.text}
             </Text>
           ) : null}
-          {bubble.image ? (
-            <Image source={{ uri: bubble.image }} style={styles.image} resizeMode="contain" />
-          ) : null}
+          <MediaFrame bubble={bubble} />
           {long && (
             <Pressable onPress={() => setExpanded((v) => !v)}>
               <Text style={styles.more}>{expanded ? 'Show less' : 'Show more'}</Text>
@@ -165,12 +261,68 @@ const styles = StyleSheet.create({
   bodyMine: {
     color: colors.text,
   },
+  mediaWrap: {
+    marginTop: 6,
+    alignSelf: 'flex-start',
+    position: 'relative',
+  },
   image: {
-    maxHeight: 220,
-    maxWidth: 260,
+    width: 240,
+    height: 160,
     borderRadius: 8,
-    marginTop: 2,
     backgroundColor: colors.bg,
+  },
+  posterEmpty: {
+    backgroundColor: colors.cardRaised,
+  },
+  playOverlay: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    top: 0,
+    bottom: 0,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  play: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    borderWidth: 2,
+    borderColor: colors.cyan,
+    backgroundColor: 'rgba(10,10,10,0.55)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  playTriangle: {
+    width: 0,
+    height: 0,
+    marginLeft: 3,
+    borderTopWidth: 7,
+    borderBottomWidth: 7,
+    borderLeftWidth: 12,
+    borderTopColor: 'transparent',
+    borderBottomColor: 'transparent',
+    borderLeftColor: colors.cyan,
+  },
+  legacy: {
+    color: colors.muted,
+    fontSize: 10,
+    marginTop: 4,
+  },
+  failBox: {
+    width: 240,
+    minHeight: 72,
+    borderRadius: 8,
+    marginTop: 6,
+    backgroundColor: colors.cardRaised,
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 10,
+  },
+  fail: {
+    color: colors.muted,
+    fontSize: 12,
   },
   more: {
     color: colors.cyan,

@@ -8,7 +8,7 @@
     "start": "react-native start",
     "start:web": "vite",
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-strip-types --test src/services/mirror.test.ts src/services/transport.test.ts"
+    "test": "node --experimental-strip-types --test src/services/mirror.test.ts src/services/transport.test.ts src/services/chatPayload.test.ts src/services/mediaCrypto.test.ts"
   },
   "dependencies": {
     "@hashgraph/sdk": "^2.81.0",

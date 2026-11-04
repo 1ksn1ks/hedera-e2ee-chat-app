@@ -3,7 +3,7 @@
 // the composer (prefilled with the shown decrypted text); Save posts the
 // editEncryptedMessage directive and the engine rewrites the bubble in
 // place with the "edited" mark.
-import React, { useCallback, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   FlatList,
   Pressable,
@@ -17,6 +17,23 @@ import { MessageBubble } from '../components/MessageBubble';
 import { Composer } from '../components/Composer';
 import { RelayStatus } from '../components/RelayStatus';
 import { editOutgoingBytes, sendOutgoingBytes } from '../services/chatPayload';
+import {
+  holdPreview,
+  isVideoUrl,
+  MEDIA_BLOCKED,
+  pickLocalMedia,
+  posterForSeal,
+  releaseHeldMedia,
+  releasePreview,
+  uploadChatMedia,
+} from '../services/mediaCrypto';
+
+interface DraftMedia {
+  url: string;
+  poster: string;
+  preview: string;
+  kind: 'image' | 'video';
+}
 
 interface Row {
   bubble: Bubble;
@@ -31,6 +48,8 @@ interface Props {
 export function ChatScreen({ chat }: Props) {
   const [editing, setEditing] = useState<Bubble | null>(null);
   const [notice, setNotice] = useState('');
+  const [draft, setDraft] = useState<DraftMedia | null>(null);
+  const [attachBusy, setAttachBusy] = useState(false);
   const listRef = useRef<FlatList<Row>>(null);
 
   const topic = chat.meta?.topicId || '';
@@ -40,12 +59,58 @@ export function ChatScreen({ chat }: Props) {
     setTimeout(() => setNotice(''), 4000);
   }, []);
 
+  useEffect(() => () => releaseHeldMedia(), []);
+
+  useEffect(() => {
+    if (!chat.account) setDraft(null);
+  }, [chat.account]);
+
+  const onAttach = useCallback(async () => {
+    if (!chat.useRelay) {
+      flash(MEDIA_BLOCKED);
+      return;
+    }
+    const picked = await pickLocalMedia();
+    if (!picked) return;
+    setAttachBusy(true);
+    const preview = holdPreview(picked.bytes, picked.mime);
+    try {
+      const uploaded = await uploadChatMedia({
+        bytes: picked.bytes,
+        mime: picked.mime,
+        mode: 'relay',
+        account: chat.account || '',
+      });
+      const kind = picked.mime.startsWith('video/') || isVideoUrl(uploaded.url) ? 'video' : 'image';
+      const poster = kind === 'video' ? await posterForSeal(picked.bytes, picked.mime, '', uploaded.url) : '';
+      setDraft((prev) => {
+        if (prev && prev.preview && prev.preview !== preview) releasePreview(prev.preview);
+        return { url: uploaded.url, poster, preview, kind };
+      });
+    } catch (e: unknown) {
+      releasePreview(preview);
+      flash(e instanceof Error ? e.message : 'Upload failed');
+    } finally {
+      setAttachBusy(false);
+    }
+  }, [chat.account, chat.useRelay, flash]);
+
   const onSend = useCallback(
     async (text: string) => {
-      const res = await chat.send(text, '');
-      if (!res.ok) flash(res.error || 'Send failed');
+      if (draft && !chat.useRelay) {
+        flash(MEDIA_BLOCKED);
+        return;
+      }
+      const res = await chat.send(text, draft?.url || '', draft?.poster || '');
+      if (!res.ok) {
+        flash(res.error || 'Send failed');
+        return;
+      }
+      if (res.droppedPoster) flash('Thumbnail too big for this message, sent without it');
+      releaseHeldMedia();
+      setDraft(null);
     },
-    [chat, flash]
+    [chat, draft, flash]
   );
 
   const onSaveEdit = useCallback(
@@ -57,12 +122,15 @@ export function ChatScreen({ chat }: Props) {
         return;
       }
       setEditing(null);
-      flash('Saved');
+      flash(res.droppedPoster ? 'Thumbnail too big for this message, sent without it' : 'Saved');
     },
     [chat, editing, flash]
   );
 
-  const predictSend = useCallback((text: string) => sendOutgoingBytes(text, ''), []);
+  const predictSend = useCallback(
+    (text: string) => sendOutgoingBytes(text, draft?.url || '', draft?.poster || ''),
+    [draft]
+  );
   const predictEdit = useCallback(
     (text: string) =>
       editing
@@ -73,7 +141,8 @@ export function ChatScreen({ chat }: Props) {
               image: editing.image || undefined,
             },
             text,
-            editing.image
+            editing.image,
+            editing.poster
           )
         : 0,
     [editing]
@@ -143,12 +212,20 @@ export function ChatScreen({ chat }: Props) {
       <Composer
         placeholder="Encrypted message…"
         disabled={composerDisabled}
-        busy={false}
+        busy={attachBusy}
+        busyLabel={attachBusy ? 'Uploading…' : undefined}
         predict={editing ? predictEdit : predictSend}
         onSend={onSend}
         editing={editing ? { label: formatStamp(editing.created), initialText: editing.text } : null}
         onSaveEdit={onSaveEdit}
         onCancelEdit={() => setEditing(null)}
+        attachment={draft ? { kind: draft.kind, preview: draft.kind === 'video' && draft.poster ? draft.poster : draft.preview } : null}
+        onAttach={onAttach}
+        onClearAttachment={() => {
+          releaseHeldMedia();
+          setDraft(null);
+        }}
+        mediaNote={chat.useRelay ? '' : MEDIA_BLOCKED}
       />
     </View>
   );

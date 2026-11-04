@@ -6,6 +6,7 @@
 // surprise the wallet.
 import React, { useEffect, useMemo, useState } from 'react';
 import {
+  Image,
   Pressable,
   StyleSheet,
   Text,
@@ -26,6 +27,10 @@ interface Props {
   editing?: { label: string; initialText: string } | null;
   onSaveEdit?: (text: string) => void;
   onCancelEdit?: () => void;
+  attachment?: { kind: 'image' | 'video'; preview: string } | null;
+  onAttach?: () => void;
+  onClearAttachment?: () => void;
+  mediaNote?: string;
 }
 
 export function Composer({
@@ -38,6 +43,10 @@ export function Composer({
   editing,
   onSaveEdit,
   onCancelEdit,
+  attachment,
+  onAttach,
+  onClearAttachment,
+  mediaNote,
 }: Props) {
   const [text, setText] = useState('');
 
@@ -52,17 +61,20 @@ export function Composer({
   }, [editing]);
 
   const usage = useMemo(() => {
-    if (!text.trim() && !editing) return null;
+    if (!text.trim() && !editing && !attachment) return null;
     return formatHcsUsage(predict(text));
-  }, [text, editing, predict]);
+  }, [text, editing, predict, attachment]);
 
   const over = !!usage?.over;
-  const showCounter = !!usage && (editing || over || predict(text) >= HCS_SHOW_COUNTER_AFTER);
+  const hasMedia = !!attachment && !editing;
+  const showCounter = !!usage && (editing || hasMedia || over || predict(text) >= HCS_SHOW_COUNTER_AFTER);
+  const canSubmit = !disabled && !busy && !over && (!!text.trim() || hasMedia);
 
   const submit = () => {
     const value = text.trim();
-    if (!value || busy || over) return;
+    if (!canSubmit) return;
     if (editing && onSaveEdit) {
+      if (!value) return;
       onSaveEdit(value);
       setText('');
     } else if (!editing) {
@@ -83,7 +95,33 @@ export function Composer({
           </Pressable>
         </View>
       )}
+      {mediaNote ? <Text style={styles.mediaNote}>{mediaNote}</Text> : null}
+      {hasMedia && attachment ? (
+        <View style={styles.draft}>
+          {attachment.preview ? (
+            <Image source={{ uri: attachment.preview }} style={styles.thumb} />
+          ) : (
+            <View style={styles.thumb} />
+          )}
+          <Text style={styles.draftLabel}>{attachment.kind === 'video' ? 'Video' : 'Photo'}</Text>
+          <Pressable hitSlop={8} onPress={onClearAttachment} accessibilityRole="button">
+            <Text style={styles.cancelText}>Remove</Text>
+          </Pressable>
+        </View>
+      ) : null}
       <View style={styles.row}>
+        {!editing && onAttach ? (
+          <Pressable
+            onPress={onAttach}
+            disabled={disabled || busy}
+            hitSlop={8}
+            style={[styles.attach, (disabled || busy || !!mediaNote) && styles.attachOff]}
+            accessibilityRole="button"
+            accessibilityLabel="Attach photo or video"
+          >
+            <Text style={styles.attachText}>+</Text>
+          </Pressable>
+        ) : null}
         <TextInput
           value={text}
           onChangeText={setText}
@@ -98,10 +136,10 @@ export function Composer({
         />
         <Pressable
           onPress={submit}
-          disabled={disabled || busy || over || !text.trim().length}
+          disabled={!canSubmit}
           style={[
             styles.send,
-            (disabled || busy || over || !text.trim().length) && styles.sendOff,
+            !canSubmit && styles.sendOff,
           ]}
           accessibilityRole="button"
         >
@@ -155,10 +193,53 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '600',
   },
+  mediaNote: {
+    color: colors.muted,
+    fontSize: 11,
+    lineHeight: 15,
+    marginBottom: 8,
+  },
+  draft: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginBottom: 8,
+  },
+  thumb: {
+    width: 36,
+    height: 36,
+    borderRadius: 8,
+    backgroundColor: colors.cardRaised,
+  },
+  draftLabel: {
+    flex: 1,
+    color: colors.text,
+    fontSize: 12,
+    fontWeight: '600',
+  },
   row: {
     flexDirection: 'row',
     alignItems: 'flex-end',
     gap: 8,
+  },
+  attach: {
+    width: 44,
+    height: 44,
+    borderRadius: radius.chip,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: colors.glass,
+    borderWidth: 1,
+    borderColor: colors.cyanSoft,
+  },
+  attachOff: {
+    opacity: 0.4,
+  },
+  attachText: {
+    color: colors.cyan,
+    fontSize: 22,
+    lineHeight: 24,
+    fontWeight: '600',
   },
   input: {
     flex: 1,
