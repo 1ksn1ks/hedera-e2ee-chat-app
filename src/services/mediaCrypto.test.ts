@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import {
   MEDIA_BLOCKED,
   decryptStream,
@@ -197,4 +197,18 @@ test('globe decrypts the bytes this app would upload', async () => {
   header = out.header;
   const opened = await globe.decryptStream(body, key, header);
   assert.deepEqual(new Uint8Array(await opened.arrayBuffer()), JPEG);
+});
+
+test('a video poster seeks once and draws every edge from that frame', () => {
+  const crypto = readFileSync(new URL('./mediaCrypto.ts', import.meta.url), 'utf8');
+  assert.equal(crypto.includes('captureFrame'), false);
+  assert.equal(crypto.split('URL.createObjectURL').length - 1, 1);
+  assert.equal(crypto.split('video.currentTime = at').length - 1, 1);
+  assert.match(crypto, /URL\.revokeObjectURL/);
+  assert.match(crypto, /for \(const edge of THUMB_EDGES\)/);
+  assert.match(crypto, /frame\.jpegAt\(edge\)/);
+  assert.match(crypto, /frame\.close\(\)/);
+  assert.match(crypto, /toDataURL\('image\/jpeg', 0\.85\)/);
+  assert.match(crypto, /choice\.mode === 'embed'/);
+  assert.match(crypto, /postSealedBlob/);
 });

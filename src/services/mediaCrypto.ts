@@ -69,11 +69,16 @@ function dataUrlBytes(dataUrl: string): Uint8Array | null {
   return out;
 }
 
-function captureFrame(
-  bytes: Uint8Array,
-  mime: string,
-  edge: number
-): Promise<{ bytes: Uint8Array; w: number; h: number } | null> {
+type PosterFrame = {
+  w: number;
+  h: number;
+  jpegAt: (edge: number) => Uint8Array | null;
+  close: () => void;
+};
+
+// One blob URL and one video element. Seek once. Each edge is a canvas
+// draw of that same frame. The URL stays until close(), after the draws.
+function loadPosterVideo(bytes: Uint8Array, mime: string): Promise<PosterFrame | null> {
   if (typeof document === 'undefined' || !mime.startsWith('video/')) return Promise.resolve(null);
   const copy = new Uint8Array(bytes.byteLength);
   copy.set(bytes);
@@ -84,10 +89,10 @@ function captureFrame(
     video.playsInline = true;
     video.preload = 'auto';
     let done = false;
-    const finish = (value: { bytes: Uint8Array; w: number; h: number } | null) => {
-      if (done) return;
-      done = true;
-      window.clearTimeout(timer);
+    let closed = false;
+    const release = () => {
+      if (closed) return;
+      closed = true;
       try {
         URL.revokeObjectURL(blobUrl);
       } catch {
@@ -99,46 +104,55 @@ function captureFrame(
       } catch {
         /* already idle */
       }
+    };
+    const finish = (value: PosterFrame | null) => {
+      if (done) return;
+      done = true;
+      window.clearTimeout(timer);
+      if (!value) release();
       resolve(value);
     };
     const timer = window.setTimeout(() => finish(null), 4000);
+    const ready = () => {
+      const w = video.videoWidth || 0;
+      const h = video.videoHeight || 0;
+      if (!w || !h) {
+        finish(null);
+        return;
+      }
+      finish({
+        w,
+        h,
+        jpegAt(edge: number) {
+          try {
+            const long = Math.max(w, h);
+            const scale = long > edge ? edge / long : 1;
+            const canvas = document.createElement('canvas');
+            canvas.width = evenFloor(w * scale);
+            canvas.height = evenFloor(h * scale);
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return null;
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            return dataUrlBytes(canvas.toDataURL('image/jpeg', 0.85));
+          } catch {
+            return null;
+          }
+        },
+        close: release,
+      });
+    };
     video.onerror = () => finish(null);
     video.onloadeddata = () => {
       const at = video.duration > 0 ? Math.min(THUMB_AT_S, Math.max(0, video.duration - 0.05)) : 0;
-      const draw = () => {
-        try {
-          const w = video.videoWidth || 0;
-          const h = video.videoHeight || 0;
-          if (!w || !h) {
-            finish(null);
-            return;
-          }
-          const long = Math.max(w, h);
-          const scale = long > edge ? edge / long : 1;
-          const canvas = document.createElement('canvas');
-          canvas.width = evenFloor(w * scale);
-          canvas.height = evenFloor(h * scale);
-          const ctx = canvas.getContext('2d');
-          if (!ctx) {
-            finish(null);
-            return;
-          }
-          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-          const jpeg = dataUrlBytes(canvas.toDataURL('image/jpeg', 0.85));
-          finish(jpeg ? { bytes: jpeg, w, h } : null);
-        } catch {
-          finish(null);
-        }
-      };
       if (Math.abs((video.currentTime || 0) - at) < 0.001) {
-        draw();
+        ready();
         return;
       }
-      video.onseeked = draw;
+      video.onseeked = () => ready();
       try {
         video.currentTime = at;
       } catch {
-        draw();
+        ready();
       }
     };
     video.src = blobUrl;
@@ -208,48 +222,54 @@ async function sealVideoPoster(
   let jpeg: Uint8Array | null = null;
   let w = 0;
   let h = 0;
-  for (const edge of THUMB_EDGES) {
-    const frame = await captureFrame(bytes, mime, edge);
-    if (!frame) return { poster: null, jpeg, w, h };
-    if (!w) {
-      w = frame.w;
-      h = frame.h;
+  const frame = await loadPosterVideo(bytes, mime);
+  if (!frame) return { poster: null, jpeg, w, h };
+  try {
+    for (const edge of THUMB_EDGES) {
+      const still = frame.jpegAt(edge);
+      if (!still) return { poster: null, jpeg, w, h };
+      if (!w) {
+        w = frame.w;
+        h = frame.h;
+      }
+      jpeg = still;
+      if (!media.w && frame.w) media.w = frame.w;
+      if (!media.h && frame.h) media.h = frame.h;
+      const choice = await sealPosterBytes(still, {
+        fits(poster) {
+          const packed = packSealedMedia(text, { ...media, poster });
+          return !!packed && e2eeWireBytes(packed) <= HCS_MESSAGE_MAX_BYTES;
+        },
+      });
+      if (choice.mode === 'embed') return { poster: choice.poster, jpeg, w, h };
+      fallback = choice;
     }
-    jpeg = frame.bytes;
-    if (!media.w && frame.w) media.w = frame.w;
-    if (!media.h && frame.h) media.h = frame.h;
-    const choice = await sealPosterBytes(frame.bytes, {
-      fits(poster) {
-        const packed = packSealedMedia(text, { ...media, poster });
-        return !!packed && e2eeWireBytes(packed) <= HCS_MESSAGE_MAX_BYTES;
-      },
+    if (!fallback || !fallback.uploads.length) return { poster: null, jpeg, w, h };
+    const upload = fallback.uploads[0];
+    const copy = new Uint8Array(upload.body.byteLength);
+    copy.set(upload.body);
+    const posterUrl = await postSealedBlob({
+      body: new Blob([copy], { type: upload.contentType }),
+      mode: 'relay',
+      account,
+      uploadToken: token,
+      backendUrl: base,
     });
-    if (choice.mode === 'embed') return { poster: choice.poster, jpeg, w, h };
-    fallback = choice;
+    return {
+      poster: {
+        url: posterUrl,
+        fileKey: fallback.poster.fileKey,
+        header: fallback.poster.header,
+        mime: 'image/jpeg',
+        size: fallback.poster.size,
+      },
+      jpeg,
+      w,
+      h,
+    };
+  } finally {
+    frame.close();
   }
-  if (!fallback || !fallback.uploads.length) return { poster: null, jpeg, w, h };
-  const upload = fallback.uploads[0];
-  const copy = new Uint8Array(upload.body.byteLength);
-  copy.set(upload.body);
-  const posterUrl = await postSealedBlob({
-    body: new Blob([copy], { type: upload.contentType }),
-    mode: 'relay',
-    account,
-    uploadToken: token,
-    backendUrl: base,
-  });
-  return {
-    poster: {
-      url: posterUrl,
-      fileKey: fallback.poster.fileKey,
-      header: fallback.poster.header,
-      mime: 'image/jpeg',
-      size: fallback.poster.size,
-    },
-    jpeg,
-    w,
-    h,
-  };
 }
 
 export async function uploadChatMedia(options: {
