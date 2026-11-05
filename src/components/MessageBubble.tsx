@@ -29,7 +29,7 @@ interface Props {
   onEdit: (bubble: Bubble) => void;
 }
 
-type OpenPart = { url?: string; b64?: string; fileKey: string; header: string; mime?: string };
+type OpenPart = { url?: string; b64?: string; fileKey: string; header: string; mime?: string; size?: number };
 
 function partKey(part: OpenPart | null): string {
   if (!part || !part.fileKey || !part.header) return '';

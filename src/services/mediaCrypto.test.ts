@@ -11,6 +11,9 @@ import {
   type UploadGrant,
 } from './sealedMedia.ts';
 
+process.env.R2_PUBLIC_BASE_URL = 'https://cdn.example/media';
+(globalThis as { __R2_PUBLIC_BASE?: string }).__R2_PUBLIC_BASE = 'https://cdn.example/media';
+
 const JPEG = new Uint8Array([0xff, 0xd8, 0xff, 0xd9, 1, 2, 3, 4]);
 const MARKER = new TextEncoder().encode('PLAINTEXT-MARKER-ftyp-SECRET-do-not-store');
 
@@ -63,7 +66,7 @@ test('relay upload posts ciphertext as octet-stream and never the mirror', async
     return {
       ok: true,
       status: 200,
-      json: async () => ({ ok: true, url: 'https://cdn.example/markers/1700000000000-ab12cd' }),
+      json: async () => ({ ok: true, url: 'https://cdn.example/media/markers/1700000000000-ab12cd' }),
     };
   };
   const out = await uploadSealedChatMedia({
@@ -76,7 +79,7 @@ test('relay upload posts ciphertext as octet-stream and never the mirror', async
     fetchImpl,
     backendUrl: 'https://onlyonhbar.com',
   });
-  assert.equal(out.url, 'https://cdn.example/markers/1700000000000-ab12cd');
+  assert.equal(out.url, 'https://cdn.example/media/markers/1700000000000-ab12cd');
   assert.equal(out.mime, 'image/jpeg');
   assert.equal(out.size, plain.byteLength);
   assert.equal(out.w, 12);
@@ -129,7 +132,7 @@ test('a 401 signs once and retries the same ciphertext', async () => {
     return {
       ok: true,
       status: 200,
-      json: async () => ({ ok: true, url: 'https://cdn.example/markers/2' }),
+      json: async () => ({ ok: true, url: 'https://cdn.example/media/markers/2' }),
     };
   };
   const storage = new Map<string, string>();
@@ -155,7 +158,7 @@ test('a 401 signs once and retries the same ciphertext', async () => {
       return grant;
     },
   });
-  assert.equal(out.url, 'https://cdn.example/markers/2');
+  assert.equal(out.url, 'https://cdn.example/media/markers/2');
   assert.equal(signs, 1);
   assert.equal(calls.length, 2);
   assert.equal(calls[0].headers['X-Upload-Token'], undefined);
@@ -180,7 +183,7 @@ test('globe decrypts the bytes this app would upload', async () => {
     return {
       ok: true,
       status: 200,
-      json: async () => ({ ok: true, url: 'https://cdn.example/markers/3' }),
+      json: async () => ({ ok: true, url: 'https://cdn.example/media/markers/3' }),
     };
   };
   const out = await uploadSealedChatMedia({

@@ -7,7 +7,9 @@ import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { sendOutgoingBytes } from './chatPayload.ts';
 import {
+  SEALED_MAX,
   STREAM_CHUNK,
+  decryptSealedPart,
   decryptStream,
   e2eeWireBytes,
   encryptStream,
@@ -15,10 +17,17 @@ import {
   packSealedMedia,
   readSealedMedia,
   sealPosterBytes,
+  sealedDownloadCap,
   sealedReady,
   signatureBytesFromWallet,
   unpackChatPayload,
+  type SealedDownloadFetch,
 } from './sealedMedia.ts';
+
+// Same public base Globe's e2eemedia tests pin. Sealed fixtures sit under it.
+process.env.R2_PUBLIC_BASE_URL = 'https://cdn.example/media';
+(globalThis as { __R2_PUBLIC_BASE?: string }).__R2_PUBLIC_BASE = 'https://cdn.example/media';
+const MEDIA_ORIGIN = 'https://cdn.example/media';
 
 const TEXT = 'hello\nthere';
 const VIDEO = 'https://cdn.example/markers/12-ab.mp4';
@@ -134,7 +143,7 @@ test('sealed pack matches step_by_step and both sides decrypt', async () => {
   assert.deepEqual(await blobBytes(await decryptStream(exactEnc.blob, exactEnc.fileKey, exactEnc.header)), exact);
 
   const media = {
-    url: 'https://cdn.example/markers/1700000000000-ab12cd',
+    url: `${MEDIA_ORIGIN}/markers/1700000000000-ab12cd`,
     fileKey: ours.fileKey,
     header: ours.header,
     mime: 'video/mp4',
@@ -206,7 +215,7 @@ test('a poster is ciphertext, embedded or uploaded, and never a clear JPEG', asy
   assert.equal(indexOfBytes(uploaded.uploads[0].body, new Uint8Array([0xff, 0xd8, 0xff])), -1);
 
   const packed = packSealedMedia('hello', {
-    url: 'https://cdn.example/markers/1700000000000-ab12cd',
+    url: `${MEDIA_ORIGIN}/markers/1700000000000-ab12cd`,
     fileKey: embedded.poster.fileKey,
     header: embedded.poster.header,
     mime: 'image/jpeg',
@@ -253,4 +262,233 @@ test('the send path no longer posts a clear file', () => {
   assert.doesNotMatch(crypto, /X-Media-Role|X-Media-Duration|X-Poster-For|Content-Disposition/);
   assert.match(screen, /uploadChatMedia/);
   assert.doesNotMatch(screen, /posterForSeal/);
+});
+
+test('a foreign origin, http, userinfo, or a dot-dot path cannot be opened', async () => {
+  await sealedReady();
+  const plain = new Uint8Array([4, 5, 6, 7]);
+  const enc = await encryptStream(plain);
+  const good = `${MEDIA_ORIGIN}/markers/1700000000000-ab12cd`;
+  const packed = packSealedMedia('hi', {
+    url: good,
+    fileKey: enc.fileKey,
+    header: enc.header,
+    mime: 'image/jpeg',
+    size: plain.byteLength,
+    w: 1,
+    h: 1,
+    poster: {
+      url: `${MEDIA_ORIGIN}/markers/1700000000000-poster`,
+      fileKey: enc.fileKey,
+      header: enc.header,
+      mime: 'image/jpeg',
+      size: plain.byteLength,
+    },
+  });
+  const read = readSealedMedia(packed);
+  assert.equal(read && read.media.url, good);
+  assert.equal(read && read.media.poster && read.media.poster.url, `${MEDIA_ORIGIN}/markers/1700000000000-poster`);
+
+  const rejectUrl = (url: string) => {
+    const body = packSealedMedia('hi', {
+      url,
+      fileKey: enc.fileKey,
+      header: enc.header,
+      mime: 'image/jpeg',
+      size: plain.byteLength,
+      w: 1,
+      h: 1,
+    });
+    assert.equal(body, '');
+    const opened = unpackChatPayload(
+      '\u001echat1\n' +
+        JSON.stringify({
+          t: 'nope',
+          m: { url, fileKey: enc.fileKey, header: enc.header, mime: 'image/jpeg', size: plain.byteLength },
+        })
+    );
+    assert.equal(opened.text, 'nope');
+    assert.equal(opened.image, '');
+    assert.ok(opened.media);
+    assert.equal(opened.media && opened.media.url, '');
+    assert.equal(opened.media && opened.media.fileKey, '');
+  };
+  rejectUrl('https://evil.example/media/markers/1-ab');
+  rejectUrl('http://cdn.example/media/markers/1-ab');
+  rejectUrl('https://cdn.example/markers/1-ab');
+  rejectUrl('https://user:pass@cdn.example/media/markers/1-ab');
+  rejectUrl('https://cdn.example/media/%2e%2e/secret');
+  rejectUrl('https://cdn.example/media/markers/a%5Cb');
+
+  const foreignPoster = packSealedMedia('hi', {
+    url: good,
+    fileKey: enc.fileKey,
+    header: enc.header,
+    mime: 'image/jpeg',
+    size: plain.byteLength,
+    w: 1,
+    h: 1,
+    poster: {
+      url: 'https://evil.example/poster.jpg',
+      fileKey: enc.fileKey,
+      header: enc.header,
+      mime: 'image/jpeg',
+      size: plain.byteLength,
+    },
+  });
+  const kept = readSealedMedia(foreignPoster);
+  assert.equal(kept && kept.media.url, good);
+  assert.equal(kept && kept.media.poster, undefined);
+
+  const bubble = readFileSync(new URL('../components/MessageBubble.tsx', import.meta.url), 'utf8');
+  assert.match(bubble, /Can't decrypt/);
+  assert.match(bubble, /!!sealed && !usable/);
+
+  let calls = 0;
+  const fetchImpl: SealedDownloadFetch = async () => {
+    calls += 1;
+    throw new Error('fetch should not run');
+  };
+  await assert.rejects(
+    () =>
+      decryptSealedPart(
+        {
+          url: 'https://evil.example/media/markers/1-ab',
+          fileKey: enc.fileKey,
+          header: enc.header,
+          size: plain.byteLength,
+        },
+        fetchImpl
+      ),
+    (err: unknown) => err instanceof Error && err.message === 'decrypt'
+  );
+  await assert.rejects(
+    () =>
+      decryptSealedPart(
+        {
+          url: 'http://cdn.example/media/markers/1-ab',
+          fileKey: enc.fileKey,
+          header: enc.header,
+          size: plain.byteLength,
+        },
+        fetchImpl
+      ),
+    (err: unknown) => err instanceof Error && err.message === 'decrypt'
+  );
+  assert.equal(calls, 0);
+});
+
+test('a redirect is not followed', async () => {
+  await sealedReady();
+  const plain = new Uint8Array([1, 2, 3, 4]);
+  const enc = await encryptStream(plain);
+  const good = `${MEDIA_ORIGIN}/markers/1700000000000-redir`;
+  let calls = 0;
+  let redirect = '';
+  let credentials = '';
+  const fetchImpl: SealedDownloadFetch = async (_url, init) => {
+    calls += 1;
+    redirect = init.redirect;
+    credentials = init.credentials;
+    if (init.redirect === 'error') throw new TypeError('redirect mode is error');
+    return {
+      ok: true,
+      headers: { get: () => null },
+      body: new Blob([new Uint8Array([9])]),
+    };
+  };
+  await assert.rejects(
+    () =>
+      decryptSealedPart(
+        {
+          url: good,
+          fileKey: enc.fileKey,
+          header: enc.header,
+          mime: 'image/jpeg',
+          size: plain.byteLength,
+        },
+        fetchImpl
+      ),
+    (err: unknown) => err instanceof Error && err.message === 'decrypt'
+  );
+  assert.equal(calls, 1);
+  assert.equal(redirect, 'error');
+  assert.equal(credentials, 'omit');
+});
+
+test('an oversized body is aborted', async () => {
+  await sealedReady();
+  const plain = new Uint8Array([1, 2, 3]);
+  const enc = await encryptStream(plain);
+  const good = `${MEDIA_ORIGIN}/markers/1700000000000-big`;
+  let reads = 0;
+  let cancelled = false;
+  const tooLong: SealedDownloadFetch = async () => ({
+    ok: true,
+    headers: {
+      get(name: string) {
+        return String(name).toLowerCase() === 'content-length' ? String(SEALED_MAX + 1) : null;
+      },
+    },
+    body: {
+      getReader() {
+        reads += 1;
+        throw new Error('read');
+      },
+      cancel() {
+        cancelled = true;
+        return Promise.resolve();
+      },
+    },
+  });
+  await assert.rejects(
+    () =>
+      decryptSealedPart(
+        { url: good, fileKey: enc.fileKey, header: enc.header },
+        tooLong
+      ),
+    (err: unknown) => err instanceof Error && err.message === 'decrypt'
+  );
+  assert.equal(reads, 0);
+  assert.equal(cancelled, true);
+
+  const cap = sealedDownloadCap(1);
+  assert.ok(cap < SEALED_MAX);
+  let streamed = 0;
+  cancelled = false;
+  const total = cap + 64;
+  const tooMany: SealedDownloadFetch = async () => ({
+    ok: true,
+    headers: { get: () => null },
+    body: new ReadableStream({
+      pull(controller) {
+        if (streamed >= total) {
+          controller.close();
+          return;
+        }
+        streamed += 1;
+        controller.enqueue(new Uint8Array(1));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    }),
+  });
+  await assert.rejects(
+    () =>
+      decryptSealedPart(
+        {
+          url: good,
+          fileKey: enc.fileKey,
+          header: enc.header,
+          size: 1,
+        },
+        tooMany
+      ),
+    (err: unknown) => err instanceof Error && err.message === 'decrypt'
+  );
+  assert.equal(cancelled, true);
+  assert.ok(streamed > cap);
+  assert.ok(streamed <= cap + 2);
+  assert.ok(streamed < total);
 });

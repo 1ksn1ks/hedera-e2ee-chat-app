@@ -308,6 +308,7 @@ export async function openSealedPart(part: {
   fileKey: string;
   header: string;
   mime?: string;
+  size?: number;
 }): Promise<string> {
   const blob = await decryptSealedPart(part);
   const bytes = new Uint8Array(await blob.arrayBuffer());

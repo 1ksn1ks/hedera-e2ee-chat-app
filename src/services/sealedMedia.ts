@@ -100,7 +100,24 @@ interface StatusError extends Error {
 
 interface ByteReader {
   read(): Promise<{ done: boolean; value?: Uint8Array }>;
+  cancel?: () => Promise<void> | void;
 }
+
+interface DownloadBody {
+  getReader?: () => ByteReader;
+  cancel?: () => Promise<void> | void;
+}
+
+interface DownloadResponse {
+  ok: boolean;
+  body: DownloadBody | null;
+  headers?: { get(name: string): string | null } | null;
+}
+
+export type SealedDownloadFetch = (
+  url: string,
+  init: { signal: AbortSignal; redirect: 'error'; credentials: 'omit' }
+) => Promise<DownloadResponse>;
 
 const EMPTY_MEDIA: SealedMedia = {
   url: '',
@@ -151,7 +168,7 @@ function concat(left: Uint8Array, right: Uint8Array): Uint8Array<ArrayBuffer> {
   return out;
 }
 
-function readerOf(source: Blob | Uint8Array | null | undefined): ByteReader {
+function readerOf(source: Blob | Uint8Array | DownloadBody | null | undefined): ByteReader {
   const streamBody = source as { getReader?: () => ByteReader; body?: { getReader?: () => ByteReader } } | null;
   if (streamBody && typeof streamBody.getReader === 'function') return streamBody.getReader();
   if (streamBody && streamBody.body && typeof streamBody.body.getReader === 'function') {
@@ -175,6 +192,53 @@ function relayBase(): string {
   const configured = (globalThis as { __E2EE_BACKEND_URL__?: string }).__E2EE_BACKEND_URL__;
   if (typeof configured === 'string') return configured.replace(/\/+$/, '');
   return 'https://onlyonhbar.com';
+}
+
+// Public origin of a sealed upload. The relay answers
+// `${R2_PUBLIC_BASE}/${key}` (step_by_step server/index.js) and the page
+// receives that string as globalThis.__R2_PUBLIC_BASE. https only:
+// an http override is not rewritten to https and is not accepted.
+const R2_PUBLIC_ORIGIN = 'https://pub-243bb90aeefc464884cd212612165e5b.r2.dev';
+
+export function r2PublicBase(): string {
+  const env = (globalThis as { process?: { env?: { R2_PUBLIC_BASE_URL?: string } } }).process?.env
+    ?.R2_PUBLIC_BASE_URL;
+  if (typeof env === 'string' && env) return env.replace(/\/+$/, '');
+  const page = (globalThis as { __R2_PUBLIC_BASE?: unknown }).__R2_PUBLIC_BASE;
+  if (typeof page === 'string' && page) return page.replace(/\/+$/, '');
+  return R2_PUBLIC_ORIGIN;
+}
+
+// https only, same origin and path prefix as the upload's public base.
+// A username, a password, "..", or a backslash makes the URL unusable.
+function sealedMediaUrl(value: string): string {
+  const baseRaw = r2PublicBase();
+  if (!baseRaw || typeof value !== 'string' || !value) return '';
+  let base: URL;
+  let url: URL;
+  try {
+    base = new URL(baseRaw);
+    url = new URL(value);
+  } catch {
+    return '';
+  }
+  if (base.protocol !== 'https:' || url.protocol !== 'https:') return '';
+  if (url.username || url.password) return '';
+  if (url.origin !== base.origin) return '';
+  const prefix = base.pathname.replace(/\/+$/, '');
+  let path = url.pathname;
+  try {
+    path = decodeURIComponent(url.pathname);
+  } catch {
+    return '';
+  }
+  if (!path || path.includes('\\') || path.includes('\0')) return '';
+  const segments = path.split('/');
+  if (segments.includes('..') || segments.includes('.')) return '';
+  if (prefix && path !== prefix && !path.startsWith(prefix + '/')) return '';
+  const key = path.slice(prefix.length).replace(/^\/+/, '');
+  if (!key || key.includes('..')) return '';
+  return url.origin + url.pathname;
 }
 
 function safeHttp(value: string): string {
@@ -265,14 +329,14 @@ function normalizePoster(poster: SealedPoster | null | undefined): SealedPoster 
     }
     return { b64: poster.b64, fileKey, header, mime, size };
   }
-  const url = safeHttp(poster.url || '');
+  const url = sealedMediaUrl(poster.url || '');
   if (!url) return null;
   return { url, fileKey, header, mime, size };
 }
 
 export function normalizeMedia(media: SealedMedia | null | undefined): SealedMedia | null {
   if (!media || typeof media !== 'object') return null;
-  const url = safeHttp(media.url);
+  const url = sealedMediaUrl(media.url);
   const fileKey = b64Field(media.fileKey, keyBytes());
   const header = b64Field(media.header, headerBytes());
   if (!url || !fileKey || !header) return null;
@@ -463,10 +527,74 @@ export async function encryptStream(
   };
 }
 
+// Plaintext size plus one authenticator per secretstream frame. The header
+// stays in the sealed message, so it is not part of the download. A missing
+// or empty declared size stops at SEALED_MAX. A known size stops earlier.
+export function sealedDownloadCap(size: number | undefined): number {
+  const n = Number(size);
+  if (!Number.isFinite(n) || n <= 0) return SEALED_MAX;
+  const plain = Math.min(Math.floor(n), SEALED_MAX);
+  const frames = Math.ceil(plain / STREAM_CHUNK);
+  const overhead = frames * sodium.crypto_secretstream_xchacha20poly1305_ABYTES;
+  return Math.min(SEALED_MAX, plain + overhead);
+}
+
+function headerLength(response: DownloadResponse): number {
+  const headers = response && response.headers;
+  if (!headers || typeof headers.get !== 'function') return 0;
+  const raw = headers.get('content-length');
+  if (raw == null || raw === '') return 0;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) return 0;
+  return n;
+}
+
+async function fetchSealed(
+  url: string,
+  cap: number,
+  fetchImpl: SealedDownloadFetch
+): Promise<{ body: DownloadBody; stop: () => void }> {
+  const controller = new AbortController();
+  const stop = () => {
+    try {
+      controller.abort();
+    } catch {
+      // Already aborted.
+    }
+  };
+  let response: DownloadResponse;
+  try {
+    response = await fetchImpl(url, {
+      signal: controller.signal,
+      redirect: 'error',
+      credentials: 'omit',
+    });
+  } catch {
+    stop();
+    throw new Error('decrypt');
+  }
+  if (!response || !response.ok || !response.body) {
+    stop();
+    throw new Error('decrypt');
+  }
+  const announced = headerLength(response);
+  if (announced > cap) {
+    stop();
+    try {
+      await response.body.cancel?.();
+    } catch {
+      // Unread.
+    }
+    throw new Error('decrypt');
+  }
+  return { body: response.body, stop };
+}
+
 export async function decryptStream(
-  source: Blob | Uint8Array,
+  source: Blob | Uint8Array | DownloadBody,
   fileKeyB64: string,
-  headerB64: string
+  headerB64: string,
+  cap: number = SEALED_MAX
 ): Promise<Blob> {
   await sealedReady();
   const key = sodium.from_base64(fileKeyB64);
@@ -485,12 +613,24 @@ export async function decryptStream(
     if (opened.tag === tagFinal) sawFinal = true;
   };
   const reader = readerOf(source);
+  const limit = Number(cap);
+  let seen = 0;
   let carry = new Uint8Array(0);
   while (true) {
     const step = await reader.read();
     if (step.done) break;
     if (!step.value || !step.value.length) continue;
-    carry = concat(carry, step.value);
+    const value = step.value instanceof Uint8Array ? step.value : new Uint8Array(step.value);
+    seen += value.byteLength;
+    if (Number.isFinite(limit) && seen > limit) {
+      try {
+        await reader.cancel?.();
+      } catch {
+        // Already closed.
+      }
+      throw new Error('decrypt');
+    }
+    carry = concat(carry, value);
     while (carry.length >= frameBytes) {
       const frame = carry.slice(0, frameBytes);
       carry = carry.subarray(frameBytes);
@@ -507,29 +647,56 @@ export async function decryptStream(
   return blobOf(parts);
 }
 
-export async function decryptSealedPart(part: {
-  url?: string;
-  b64?: string;
-  fileKey: string;
-  header: string;
-  mime?: string;
-}): Promise<Blob> {
+export async function decryptSealedPart(
+  part: {
+    url?: string;
+    b64?: string;
+    fileKey: string;
+    header: string;
+    mime?: string;
+    size?: number;
+  },
+  fetchImpl?: SealedDownloadFetch
+): Promise<Blob> {
   await sealedReady();
   if (!part.fileKey || !part.header) throw new Error('decrypt');
-  let source: Blob | Uint8Array;
-  if (typeof part.b64 === 'string' && part.b64) {
-    source = blobOf([sodium.from_base64(part.b64)]);
-  } else if (typeof part.url === 'string' && part.url) {
-    const response = await fetch(part.url);
-    if (!response.ok || !response.body) throw new Error('decrypt');
-    source = response.body as unknown as Blob;
-  } else {
+  const cap = sealedDownloadCap(part.size);
+  let stop = (): void => {};
+  try {
+    let source: Blob | Uint8Array | DownloadBody;
+    if (typeof part.b64 === 'string' && part.b64) {
+      let raw: Uint8Array;
+      try {
+        raw = sodium.from_base64(part.b64);
+      } catch {
+        throw new Error('decrypt');
+      }
+      if (!raw.length || raw.byteLength > cap) throw new Error('decrypt');
+      source = blobOf([raw]);
+    } else {
+      const href = sealedMediaUrl(part.url || '');
+      if (!href) throw new Error('decrypt');
+      const opened = await fetchSealed(
+        href,
+        cap,
+        fetchImpl ?? ((url, init) => fetch(url, init) as Promise<DownloadResponse>)
+      );
+      stop = opened.stop;
+      source = opened.body;
+    }
+    const plain = await decryptStream(source, part.fileKey, part.header, cap);
+    const type = typeof part.mime === 'string' && part.mime ? part.mime : SEALED_CONTENT_TYPE;
+    const bytes = new Uint8Array(await plain.arrayBuffer());
+    return blobOf([bytes], type);
+  } catch (err) {
+    try {
+      stop();
+    } catch {
+      // Already stopped.
+    }
+    if (err instanceof Error && err.message === 'decrypt') throw err;
     throw new Error('decrypt');
   }
-  const plain = await decryptStream(source, part.fileKey, part.header);
-  const type = typeof part.mime === 'string' && part.mime ? part.mime : SEALED_CONTENT_TYPE;
-  const bytes = new Uint8Array(await plain.arrayBuffer());
-  return blobOf([bytes], type);
 }
 
 export async function sealPosterBytes(
@@ -728,7 +895,7 @@ async function readUploadUrl(res: UploadResponse): Promise<string> {
   } catch {
     throw new Error('Upload failed');
   }
-  const url = safeHttp(typeof data.url === 'string' ? data.url : '');
+  const url = sealedMediaUrl(typeof data.url === 'string' ? data.url : '');
   if (data.ok !== true || !url || isMirrorUrl(url)) throw new Error('Upload failed');
   return url;
 }
