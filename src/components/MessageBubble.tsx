@@ -5,6 +5,7 @@
 // mark. Long-press on an OWN confirmed bubble offers Edit.
 import React, { useEffect, useRef, useState, type RefObject } from 'react';
 import {
+  AccessibilityInfo,
   Image,
   Linking,
   Pressable,
@@ -36,14 +37,56 @@ interface Props {
 
 type OpenPart = { url?: string; b64?: string; fileKey: string; header: string; mime?: string; size?: number };
 
-type SealedVideoProps = { src: string; style?: ViewStyle };
+type SealedVideoProps = { src: string; style?: ViewStyle; loop?: boolean; muted?: boolean };
 
 let SealedVideo: React.ComponentType<SealedVideoProps> | null = null;
 
-function NativeClip({ src, style }: SealedVideoProps) {
+function NativeClip({ src, style, loop, muted }: SealedVideoProps) {
   if (!SealedVideo) SealedVideo = requireNativeComponent<SealedVideoProps>('SealedVideo');
   const Clip = SealedVideo;
-  return <Clip src={src} style={style} />;
+  return <Clip src={src} style={style} loop={loop} muted={muted} />;
+}
+
+function gifClipOf(media: { mime?: string; gif?: unknown } | null | undefined): boolean {
+  if (!media || typeof media.mime !== 'string' || !media.mime.startsWith('video/')) return false;
+  return media.gif === 1 || media.gif === true;
+}
+
+// e2eechatview.js motionReduced. A throw means motion is allowed.
+function useReducedMotion(): boolean {
+  const [reduced, setReduced] = useState(false);
+  useEffect(() => {
+    let dead = false;
+    const apply = (on: boolean) => {
+      if (!dead) setReduced(on);
+    };
+    try {
+      if (typeof matchMedia === 'function') {
+        const query = matchMedia('(prefers-reduced-motion: reduce)');
+        apply(!!query.matches);
+        const onChange = () => apply(!!query.matches);
+        if (typeof query.addEventListener === 'function') query.addEventListener('change', onChange);
+        else (query as MediaQueryList & { addListener?: (fn: () => void) => void }).addListener?.(onChange);
+        return () => {
+          dead = true;
+          if (typeof query.removeEventListener === 'function') query.removeEventListener('change', onChange);
+          else (query as MediaQueryList & { removeListener?: (fn: () => void) => void }).removeListener?.(onChange);
+        };
+      }
+    } catch {
+      apply(false);
+    }
+    let sub: { remove: () => void } | undefined;
+    AccessibilityInfo.isReduceMotionEnabled()
+      .then((on) => apply(!!on))
+      .catch(() => apply(false));
+    sub = AccessibilityInfo.addEventListener('reduceMotionChanged', (on) => apply(!!on));
+    return () => {
+      dead = true;
+      sub?.remove();
+    };
+  }, []);
+  return reduced;
 }
 
 function partKey(part: OpenPart | null): string {
@@ -153,18 +196,21 @@ function MediaFrame({ bubble, near }: { bubble: Bubble; near: boolean }) {
   const sealed = bubble.media;
   const usable = !!(sealed && sealed.fileKey && sealed.header && sealed.url);
   const video = sealed ? sealed.mime.startsWith('video/') : isVideoUrl(bubble.image);
+  const gifClip = gifClipOf(sealed);
+  const reduced = useReducedMotion();
+  const gifPlay = gifClip && !reduced;
   const [playing, setPlaying] = useState(false);
   const [broken, setBroken] = useState(false);
   const poster = useMemoryUrl(usable && sealed?.poster ? posterPart(sealed.poster) : null, near);
   const still = useMemoryUrl(usable && sealed && !video ? sealed : null, near);
-  const clip = useMemoryUrl(usable && sealed && video && playing ? sealed : null, near);
+  const clip = useMemoryUrl(usable && sealed && video && (playing || gifPlay) ? sealed : null, near);
   const legacy = bubble.legacyPlain ? <Text style={styles.legacy}>unencrypted (old)</Text> : null;
   if (!sealed && !bubble.image && !bubble.poster) return null;
   const failed =
     broken ||
     (!!sealed && !usable) ||
     still.failed ||
-    (playing && clip.failed);
+    ((playing || gifPlay) && clip.failed);
   if (failed) {
     return (
       <View style={styles.failBox}>
@@ -173,13 +219,14 @@ function MediaFrame({ bubble, near }: { bubble: Bubble; near: boolean }) {
       </View>
     );
   }
-  if (video && playing && (sealed ? clip.uri : bubble.image)) {
+  if (video && (playing || gifPlay) && (sealed ? clip.uri : bubble.image)) {
     return (
       <View style={styles.mediaWrap}>
         <Playable
           uri={sealed ? clip.uri : bubble.image}
           poster={sealed ? poster.uri : bubble.poster}
           memory={!!sealed}
+          gifClip={gifClip}
           onError={() => setBroken(true)}
         />
         {legacy}
@@ -196,19 +243,21 @@ function MediaFrame({ bubble, near }: { bubble: Bubble; near: boolean }) {
           ) : (
             <View style={[styles.image, styles.posterEmpty]} />
           )}
-          <View style={styles.playOverlay} pointerEvents="box-none">
-            <Pressable
-              onPress={() => {
-                setPlaying(true);
-              }}
-              style={styles.play}
-              accessibilityRole="button"
-              accessibilityLabel="Play video"
-              hitSlop={8}
-            >
-              <View style={styles.playTriangle} />
-            </Pressable>
-          </View>
+          {gifClip ? null : (
+            <View style={styles.playOverlay} pointerEvents="box-none">
+              <Pressable
+                onPress={() => {
+                  setPlaying(true);
+                }}
+                style={styles.play}
+                accessibilityRole="button"
+                accessibilityLabel="Play video"
+                hitSlop={8}
+              >
+                <View style={styles.playTriangle} />
+              </Pressable>
+            </View>
+          )}
         </View>
         {legacy}
       </View>
@@ -234,14 +283,16 @@ function Playable({
   poster,
   onError,
   memory,
+  gifClip,
 }: {
   uri: string;
   poster: string;
   onError: () => void;
   memory?: boolean;
+  gifClip?: boolean;
 }) {
   if (typeof document === 'undefined') {
-    if (memory) return <NativeClip src={uri} style={styles.image} />;
+    if (memory) return <NativeClip src={uri} style={styles.image} loop={!!gifClip} muted={!!gifClip} />;
     return (
       <Pressable onPress={() => Linking.openURL(uri)} style={styles.failBox} accessibilityRole="button">
         <Text style={styles.fail}>Play</Text>
@@ -251,7 +302,9 @@ function Playable({
   return React.createElement('video' as unknown as 'div', {
     src: uri,
     poster: poster || undefined,
-    controls: true,
+    controls: !gifClip,
+    muted: !!gifClip,
+    loop: !!gifClip,
     playsInline: true,
     autoPlay: true,
     onError,

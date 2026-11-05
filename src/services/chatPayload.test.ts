@@ -666,3 +666,47 @@ test('sealed stills decrypt only near the screen, two at a time', async () => {
   assert.equal(gate.inFlight(), 0);
   assert.equal(gate.queued(), 0);
 });
+
+test('gif:1 is kept through normalize and pack, matching Globe', async () => {
+  assert.equal(existsSync(GLOBE_MEDIA), true);
+  await sealedReady();
+  const globe = (await import(pathToFileURL(GLOBE_MEDIA).href)) as {
+    packSealedMedia: (text: string, media: unknown) => string;
+    readSealedMedia: (raw: string) => { media: { gif?: number } } | null;
+  };
+  const enc = await encryptStream(new Uint8Array([1, 2, 3, 4]));
+  const base = {
+    url: `${MEDIA_ORIGIN}/markers/1700000000000-ab12cd`,
+    fileKey: enc.fileKey,
+    header: enc.header,
+    mime: 'video/mp4',
+    size: 4,
+    w: 16,
+    h: 16,
+  };
+  const flagged = { ...base, gif: 1 };
+  const ours = packSealedMedia('loop', flagged);
+  const theirs = globe.packSealedMedia('loop', flagged);
+  assert.equal(ours, theirs);
+  const read = readSealedMedia(ours);
+  assert.equal(read && read.media.gif, 1);
+  const globeRead = globe.readSealedMedia(ours);
+  assert.equal(globeRead && globeRead.media.gif, 1);
+  assert.equal(packSealedMedia('loop', { ...base, gif: true as unknown as 1 }), ours);
+
+  for (const gif of [0, 2, '1', false]) {
+    const packed = packSealedMedia('loop', { ...base, gif: gif as never });
+    assert.equal(packed, packSealedMedia('loop', base));
+    const opened = readSealedMedia(packed);
+    assert.equal(opened && opened.media.gif, undefined);
+  }
+
+  const bubble = readFileSync(new URL('../components/MessageBubble.tsx', import.meta.url), 'utf8');
+  assert.match(bubble, /prefers-reduced-motion: reduce/);
+  assert.match(bubble, /controls: !gifClip/);
+  assert.match(bubble, /muted: !!gifClip/);
+  assert.match(bubble, /loop: !!gifClip/);
+  assert.match(bubble, /media\.gif === 1 \|\| media\.gif === true/);
+  const sealed = readFileSync(new URL('./sealedMedia.ts', import.meta.url), 'utf8');
+  assert.match(sealed, /clean\.gif = 1/);
+});

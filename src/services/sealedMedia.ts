@@ -55,6 +55,8 @@ export interface SealedMedia {
   w: number;
   h: number;
   poster?: SealedPoster;
+  /** Globe sets this when a GIF was converted to a muted looping clip. */
+  gif?: 1;
 }
 
 export interface ChatParts {
@@ -383,6 +385,8 @@ export function normalizeMedia(media: SealedMedia | null | undefined): SealedMed
   };
   const poster = normalizePoster(media.poster);
   if (poster) clean.poster = poster;
+  const flag = (media as { gif?: unknown }).gif;
+  if (flag === 1 || flag === true) clean.gif = 1;
   return clean;
 }
 
