@@ -11,6 +11,7 @@ import {
   TopicMessageSubmitTransaction,
 } from '@hashgraph/sdk';
 import UniversalProvider from '@walletconnect/universal-provider';
+import { signatureBytesFromWallet } from './sealedMedia';
 
 // Same WalletConnect Cloud project as the notifications app.
 const PROJECT_ID = '4bb3a1d4a8c30b0e3b1bd4c7285330b6';
@@ -95,6 +96,28 @@ export async function disconnectWallet(): Promise<void> {
     provider = null;
   }
   accountCache = null;
+}
+
+function hexEncode(text: string): string {
+  return Array.from(new TextEncoder().encode(text))
+    .map((byte) => byte.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+// HIP-820. The wallet signs the nonce, and the upload server wants the raw
+// 64-byte signature (it also accepts the Hedera signed-message prefix).
+export async function signUploadNonce(nonce: string): Promise<string> {
+  if (!provider?.session) throw new Error('Connect your wallet to upload');
+  const account = await getConnectedAccount();
+  if (!account) throw new Error('Connect your wallet to upload');
+  const result: unknown = await provider.request({
+    method: 'hedera_signMessage',
+    params: [{ message: hexEncode(nonce) }],
+    account: `hedera:mainnet:${account}`,
+  });
+  const bytes = signatureBytesFromWallet(result);
+  if (!bytes || bytes.length !== 64) throw new Error('Upload failed, please try again');
+  return bytesToBase64(bytes);
 }
 
 // Base64 without Node's Buffer (RN has none): chunked btoa.

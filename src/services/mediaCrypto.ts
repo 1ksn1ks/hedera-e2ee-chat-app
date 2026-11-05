@@ -1,24 +1,50 @@
-// LOGIC CHANGE. The sealed still is a data:image URL inside the topic
-// payload (videoposter.js:145-154), not a second ciphertext. Capture matches
-// captureVideoPoster: 0.1s (videoposter.js:8) and edges 720, 480, 320, 160
-// (videoposter.js:9), shrunk until the 18 KB message fits
-// (uploadmedia.js dataUrlForSeal). The frame stays in memory. Upload and
-// preview lifetime live in mediaUpload.ts.
-import { HCS_MESSAGE_MAX_BYTES, sendOutgoingBytes } from './chatPayload';
+// LOGIC CHANGE. A video still is its own secretstream, never a clear JPEG.
+// Capture edges match videoposter.js THUMB_EDGES (720, 480, 320, 160) at 0.1s.
+// The still is embedded when the ciphertext is at most 24 KB and the sealed
+// topic message still fits 18 KB. Otherwise that ciphertext is a second
+// octet-stream upload. The composer chip is a local blob only.
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { HCS_MESSAGE_MAX_BYTES } from './chatPayload';
+import {
+  holdPreview,
+  relayUploadBase,
+} from './mediaUpload';
+import {
+  e2eeWireBytes,
+  packSealedMedia,
+  postSealedBlob,
+  rememberGrant,
+  sealPosterBytes,
+  uploadSealedChatMedia,
+  type GrantStorage,
+  type SealedMedia,
+  type SealedPoster,
+  type UploadGrant,
+  decryptSealedPart,
+} from './sealedMedia';
+import { signUploadNonce } from './wallet';
 
 export {
   MEDIA_BLOCKED,
   holdPreview,
   isVideoUrl,
   mediaSendingAllowed,
+  onMediaReleased,
   pickLocalMedia,
   releaseHeldMedia,
   releasePreview,
-  uploadChatMedia,
 } from './mediaUpload';
+
+export type { SealedMedia, SealedPoster } from './sealedMedia';
 
 const THUMB_EDGES = [720, 480, 320, 160];
 const THUMB_AT_S = 0.1;
+
+const grantStorage: GrantStorage = {
+  getItem: (key) => AsyncStorage.getItem(key),
+  setItem: (key, value) => AsyncStorage.setItem(key, value),
+  removeItem: (key) => AsyncStorage.removeItem(key),
+};
 
 function evenFloor(n: number): number {
   const v = Math.floor(Number(n) || 0);
@@ -26,8 +52,36 @@ function evenFloor(n: number): number {
   return even < 2 ? 2 : even;
 }
 
-function captureFrame(bytes: Uint8Array, mime: string, edge: number): Promise<string> {
-  if (typeof document === 'undefined' || !mime.startsWith('video/')) return Promise.resolve('');
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
+function dataUrlBytes(dataUrl: string): Uint8Array | null {
+  if (!dataUrl.startsWith('data:image/jpeg')) return null;
+  const comma = dataUrl.indexOf(',');
+  if (comma < 0) return null;
+  let bin = '';
+  try {
+    bin = atob(dataUrl.slice(comma + 1));
+  } catch {
+    return null;
+  }
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+function captureFrame(
+  bytes: Uint8Array,
+  mime: string,
+  edge: number
+): Promise<{ bytes: Uint8Array; w: number; h: number } | null> {
+  if (typeof document === 'undefined' || !mime.startsWith('video/')) return Promise.resolve(null);
   const copy = new Uint8Array(bytes.byteLength);
   copy.set(bytes);
   const blobUrl = URL.createObjectURL(new Blob([copy], { type: mime }));
@@ -37,7 +91,7 @@ function captureFrame(bytes: Uint8Array, mime: string, edge: number): Promise<st
     video.playsInline = true;
     video.preload = 'auto';
     let done = false;
-    const finish = (value: string) => {
+    const finish = (value: { bytes: Uint8Array; w: number; h: number } | null) => {
       if (done) return;
       done = true;
       window.clearTimeout(timer);
@@ -52,10 +106,10 @@ function captureFrame(bytes: Uint8Array, mime: string, edge: number): Promise<st
       } catch {
         /* already idle */
       }
-      resolve(value.startsWith('data:image/') ? value : '');
+      resolve(value);
     };
-    const timer = window.setTimeout(() => finish(''), 4000);
-    video.onerror = () => finish('');
+    const timer = window.setTimeout(() => finish(null), 4000);
+    video.onerror = () => finish(null);
     video.onloadeddata = () => {
       const at = video.duration > 0 ? Math.min(THUMB_AT_S, Math.max(0, video.duration - 0.05)) : 0;
       const draw = () => {
@@ -63,7 +117,7 @@ function captureFrame(bytes: Uint8Array, mime: string, edge: number): Promise<st
           const w = video.videoWidth || 0;
           const h = video.videoHeight || 0;
           if (!w || !h) {
-            finish('');
+            finish(null);
             return;
           }
           const long = Math.max(w, h);
@@ -73,13 +127,14 @@ function captureFrame(bytes: Uint8Array, mime: string, edge: number): Promise<st
           canvas.height = evenFloor(h * scale);
           const ctx = canvas.getContext('2d');
           if (!ctx) {
-            finish('');
+            finish(null);
             return;
           }
           ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-          finish(canvas.toDataURL('image/jpeg', 0.85));
+          const jpeg = dataUrlBytes(canvas.toDataURL('image/jpeg', 0.85));
+          finish(jpeg ? { bytes: jpeg, w, h } : null);
         } catch {
-          finish('');
+          finish(null);
         }
       };
       if (Math.abs((video.currentTime || 0) - at) < 0.001) {
@@ -97,18 +152,166 @@ function captureFrame(bytes: Uint8Array, mime: string, edge: number): Promise<st
   });
 }
 
-// Shrink the still until the sealed topic message fits. A miss drops it.
-export async function posterForSeal(
+async function measureImage(bytes: Uint8Array, mime: string): Promise<{ w: number; h: number }> {
+  if (typeof createImageBitmap !== 'function' || !mime.startsWith('image/')) return { w: 0, h: 0 };
+  try {
+    const copy = new Uint8Array(bytes.byteLength);
+    copy.set(bytes);
+    const bmp = await createImageBitmap(new Blob([copy], { type: mime }));
+    const box = { w: bmp.width, h: bmp.height };
+    if (bmp.close) bmp.close();
+    return box;
+  } catch {
+    return { w: 0, h: 0 };
+  }
+}
+
+async function requestUploadGrant(account: string, base: string): Promise<UploadGrant> {
+  let challenge: { nonce?: unknown } | null = null;
+  try {
+    const challengeRes = await fetch(`${base}/api/upload/challenge`);
+    challenge = (await challengeRes.json().catch(() => null)) as { nonce?: unknown } | null;
+    if (!challengeRes.ok || !challenge || typeof challenge.nonce !== 'string') {
+      throw new Error('Upload failed, please try again');
+    }
+  } catch (err) {
+    if (err instanceof Error && err.message === 'Upload failed, please try again') throw err;
+    throw new Error('Upload failed, please try again');
+  }
+  const signature = await signUploadNonce(challenge.nonce as string);
+  const authRes = await fetch(`${base}/api/upload/auth`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ accountId: account, nonce: challenge.nonce, signature }),
+  });
+  const auth = (await authRes.json().catch(() => null)) as {
+    token?: unknown;
+    exp?: unknown;
+    expiresIn?: unknown;
+  } | null;
+  if (authRes.status === 503) {
+    const err = new Error('Upload auth is not configured') as Error & { status?: number };
+    err.status = 503;
+    throw err;
+  }
+  if (!authRes.ok || !auth || typeof auth.token !== 'string') {
+    throw new Error('Upload failed, please try again');
+  }
+  const grant = rememberGrant(account, auth);
+  await grantStorage.setItem(`upload-grant:${account}`, JSON.stringify(grant));
+  return grant;
+}
+
+async function sealVideoPoster(
   bytes: Uint8Array,
   mime: string,
   text: string,
-  imageUrl: string
-): Promise<string> {
-  if (!mime.startsWith('video/')) return '';
+  media: SealedMedia,
+  token: string,
+  account: string,
+  base: string
+): Promise<{ poster: SealedPoster | null; jpeg: Uint8Array | null; w: number; h: number }> {
+  let fallback: Awaited<ReturnType<typeof sealPosterBytes>> | null = null;
+  let jpeg: Uint8Array | null = null;
+  let w = 0;
+  let h = 0;
   for (const edge of THUMB_EDGES) {
-    const data = await captureFrame(bytes, mime, edge);
-    if (!data) return '';
-    if (sendOutgoingBytes(text, imageUrl, data) <= HCS_MESSAGE_MAX_BYTES) return data;
+    const frame = await captureFrame(bytes, mime, edge);
+    if (!frame) return { poster: null, jpeg, w, h };
+    if (!w) {
+      w = frame.w;
+      h = frame.h;
+    }
+    jpeg = frame.bytes;
+    if (!media.w && frame.w) media.w = frame.w;
+    if (!media.h && frame.h) media.h = frame.h;
+    const choice = await sealPosterBytes(frame.bytes, {
+      fits(poster) {
+        const packed = packSealedMedia(text, { ...media, poster });
+        return !!packed && e2eeWireBytes(packed) <= HCS_MESSAGE_MAX_BYTES;
+      },
+    });
+    if (choice.mode === 'embed') return { poster: choice.poster, jpeg, w, h };
+    fallback = choice;
   }
-  return '';
+  if (!fallback || !fallback.uploads.length) return { poster: null, jpeg, w, h };
+  const upload = fallback.uploads[0];
+  const copy = new Uint8Array(upload.body.byteLength);
+  copy.set(upload.body);
+  const posterUrl = await postSealedBlob({
+    body: new Blob([copy], { type: upload.contentType }),
+    mode: 'relay',
+    account,
+    uploadToken: token,
+    backendUrl: base,
+  });
+  return {
+    poster: {
+      url: posterUrl,
+      fileKey: fallback.poster.fileKey,
+      header: fallback.poster.header,
+      mime: 'image/jpeg',
+      size: fallback.poster.size,
+    },
+    jpeg,
+    w,
+    h,
+  };
+}
+
+export async function uploadChatMedia(options: {
+  bytes: Uint8Array;
+  mime: string;
+  mode: 'relay' | 'hedera-only';
+  account?: string;
+  text?: string;
+}): Promise<{ media: SealedMedia; chipBytes: Uint8Array | null }> {
+  const mime = String(options.mime || '').split(';')[0].trim().toLowerCase();
+  const base = relayUploadBase();
+  const account = options.account || '';
+  const dims = mime.startsWith('image/') ? await measureImage(options.bytes, mime) : { w: 0, h: 0 };
+  let chipBytes: Uint8Array | null = null;
+  const media = await uploadSealedChatMedia({
+    bytes: options.bytes,
+    mime,
+    mode: options.mode,
+    account,
+    width: dims.w,
+    height: dims.h,
+    backendUrl: base,
+    storage: grantStorage,
+    sign: account ? () => requestUploadGrant(account, base) : undefined,
+    decorate: mime.startsWith('video/')
+      ? async (partial, token) => {
+          const sealed = await sealVideoPoster(
+            options.bytes,
+            mime,
+            options.text || '',
+            partial,
+            token,
+            account,
+            base
+          );
+          chipBytes = sealed.jpeg;
+          return sealed.poster;
+        }
+      : undefined,
+  });
+  return { media, chipBytes };
+}
+
+// Decrypt one sealed part into a memory URL. Web uses a blob URL revoked
+// with the other previews. Native keeps a data URL in JS and never a file.
+export async function openSealedPart(part: {
+  url?: string;
+  b64?: string;
+  fileKey: string;
+  header: string;
+  mime?: string;
+}): Promise<string> {
+  const blob = await decryptSealedPart(part);
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  const mime = part.mime || 'application/octet-stream';
+  if (typeof document === 'undefined') return `data:${mime};base64,${bytesToBase64(bytes)}`;
+  return holdPreview(bytes, mime);
 }

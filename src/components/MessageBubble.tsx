@@ -3,7 +3,7 @@
 // showAvatar), own bubbles sit right with the cyan tint, the stamp is
 // dd/mm/yy HH:MM, and a live edit rewrites text in place with an "edited"
 // mark. Long-press on an OWN confirmed bubble offers Edit.
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   Image,
   Linking,
@@ -15,7 +15,8 @@ import {
 } from 'react-native';
 import { colors, glassCard, radius } from '../theme';
 import { Bubble } from '../hooks/useE2eeChat';
-import { isVideoUrl } from '../services/mediaCrypto';
+import { isVideoUrl, onMediaReleased, openSealedPart, releasePreview } from '../services/mediaCrypto';
+import type { SealedPoster } from '../services/sealedMedia';
 
 const AVATAR = 'https://kiloscribe.com/api/inscription-cdn/0.0.4819119';
 
@@ -28,49 +29,115 @@ interface Props {
   onEdit: (bubble: Bubble) => void;
 }
 
-// LOGIC CHANGE. The picture is the sealed media from unpackChatPayload.
-// A video shows the sealed still (`p`) and a cyan play control. A plain
-// {t, i} link is labeled "unencrypted (old)". A still that fails to open
-// shows "can't decrypt". The chrome stays the cyan glass bubble.
-function MediaFrame({ bubble }: { bubble: Bubble }) {
+type OpenPart = { url?: string; b64?: string; fileKey: string; header: string; mime?: string };
+
+function partKey(part: OpenPart | null): string {
+  if (!part || !part.fileKey || !part.header) return '';
+  if (!part.url && !part.b64) return '';
+  return `${part.fileKey}|${part.header}|${part.url || ''}|${part.b64 ? 'b' : ''}|${part.mime || ''}`;
+}
+
+// Decrypt into a memory URL. Logout and chat close revoke it.
+function useMemoryUrl(part: OpenPart | null): { uri: string; failed: boolean } {
+  const [uri, setUri] = useState('');
   const [failed, setFailed] = useState(false);
+  const partRef = useRef(part);
+  partRef.current = part;
+  const key = partKey(part);
+  useEffect(() => onMediaReleased(() => setUri('')), []);
+  useEffect(() => {
+    const current = partRef.current;
+    if (!key || !current) {
+      setUri('');
+      setFailed(false);
+      return;
+    }
+    let dead = false;
+    let opened = '';
+    setFailed(false);
+    openSealedPart(current).then(
+      (next) => {
+        if (dead) {
+          releasePreview(next);
+          return;
+        }
+        opened = next;
+        setUri(next);
+      },
+      () => {
+        if (!dead) setFailed(true);
+      }
+    );
+    return () => {
+      dead = true;
+      if (opened) releasePreview(opened);
+    };
+  }, [key]);
+  return { uri, failed };
+}
+
+function posterPart(poster: SealedPoster | undefined): OpenPart | null {
+  if (!poster || !poster.fileKey || !poster.header) return null;
+  if (!poster.b64 && !poster.url) return null;
+  return poster;
+}
+
+// A sealed file decrypts in memory. An old {t,i} link stays a clear URL
+// and is labelled "unencrypted (old)". A failure says "Can't decrypt".
+function MediaFrame({ bubble }: { bubble: Bubble }) {
+  const sealed = bubble.media;
+  const usable = !!(sealed && sealed.fileKey && sealed.header && sealed.url);
+  const video = sealed ? sealed.mime.startsWith('video/') : isVideoUrl(bubble.image);
   const [playing, setPlaying] = useState(false);
-  if (!bubble.image && !bubble.poster) return null;
-  const video = isVideoUrl(bubble.image);
+  const [broken, setBroken] = useState(false);
+  const poster = useMemoryUrl(usable && sealed?.poster ? posterPart(sealed.poster) : null);
+  const still = useMemoryUrl(usable && sealed && !video ? sealed : null);
+  const inlineVideo = typeof document !== 'undefined';
+  const clip = useMemoryUrl(usable && sealed && video && playing && inlineVideo ? sealed : null);
   const legacy = bubble.legacyPlain ? <Text style={styles.legacy}>unencrypted (old)</Text> : null;
+  if (!sealed && !bubble.image && !bubble.poster) return null;
+  const failed =
+    broken ||
+    (!!sealed && !usable) ||
+    still.failed ||
+    (playing && clip.failed);
   if (failed) {
     return (
       <View style={styles.failBox}>
-        <Text style={styles.fail}>can't decrypt</Text>
+        <Text style={styles.fail}>Can't decrypt</Text>
         {legacy}
       </View>
     );
   }
-  if (video && playing && bubble.image) {
+  if (video && playing && (sealed ? clip.uri : bubble.image)) {
     return (
       <View style={styles.mediaWrap}>
-        <Playable uri={bubble.image} poster={bubble.poster} onError={() => setFailed(true)} />
+        <Playable
+          uri={sealed ? clip.uri : bubble.image}
+          poster={sealed ? poster.uri : bubble.poster}
+          memory={!!sealed}
+          onError={() => setBroken(true)}
+        />
         {legacy}
       </View>
     );
   }
   if (video) {
+    const stillUri = sealed ? poster.uri : bubble.poster;
     return (
       <View>
         <View style={styles.mediaWrap}>
-          {bubble.poster ? (
-            <Image
-              source={{ uri: bubble.poster }}
-              style={styles.image}
-              resizeMode="cover"
-              onError={() => setFailed(true)}
-            />
+          {stillUri ? (
+            <Image source={{ uri: stillUri }} style={styles.image} resizeMode="cover" />
           ) : (
             <View style={[styles.image, styles.posterEmpty]} />
           )}
           <View style={styles.playOverlay} pointerEvents="box-none">
             <Pressable
-              onPress={() => setPlaying(true)}
+              onPress={() => {
+                if (sealed && !inlineVideo) return;
+                setPlaying(true);
+              }}
               style={styles.play}
               accessibilityRole="button"
               accessibilityLabel="Play video"
@@ -84,22 +151,40 @@ function MediaFrame({ bubble }: { bubble: Bubble }) {
       </View>
     );
   }
-  const still = bubble.image || bubble.poster;
+  const stillUri = sealed ? still.uri : bubble.image || bubble.poster;
+  if (sealed && !stillUri) return <View style={[styles.image, styles.posterEmpty]} />;
   return (
     <View>
       <Image
-        source={{ uri: still }}
+        source={{ uri: stillUri }}
         style={styles.image}
         resizeMode="cover"
-        onError={() => setFailed(true)}
+        onError={() => setBroken(true)}
       />
       {legacy}
     </View>
   );
 }
 
-function Playable({ uri, poster, onError }: { uri: string; poster: string; onError: () => void }) {
+function Playable({
+  uri,
+  poster,
+  onError,
+  memory,
+}: {
+  uri: string;
+  poster: string;
+  onError: () => void;
+  memory?: boolean;
+}) {
   if (typeof document === 'undefined') {
+    if (memory) {
+      return (
+        <View style={styles.failBox}>
+          <Text style={styles.fail}>Play</Text>
+        </View>
+      );
+    }
     return (
       <Pressable onPress={() => Linking.openURL(uri)} style={styles.failBox} accessibilityRole="button">
         <Text style={styles.fail}>Play</Text>

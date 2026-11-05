@@ -17,20 +17,18 @@ import { MessageBubble } from '../components/MessageBubble';
 import { Composer } from '../components/Composer';
 import { RelayStatus } from '../components/RelayStatus';
 import { editOutgoingBytes, sendOutgoingBytes } from '../services/chatPayload';
+import { packFitting, type SealedMedia } from '../services/sealedMedia';
 import {
   holdPreview,
-  isVideoUrl,
   MEDIA_BLOCKED,
   pickLocalMedia,
-  posterForSeal,
   releaseHeldMedia,
   releasePreview,
   uploadChatMedia,
 } from '../services/mediaCrypto';
 
 interface DraftMedia {
-  url: string;
-  poster: string;
+  media: SealedMedia;
   preview: string;
   kind: 'image' | 'video';
 }
@@ -81,11 +79,12 @@ export function ChatScreen({ chat }: Props) {
         mode: 'relay',
         account: chat.account || '',
       });
-      const kind = picked.mime.startsWith('video/') || isVideoUrl(uploaded.url) ? 'video' : 'image';
-      const poster = kind === 'video' ? await posterForSeal(picked.bytes, picked.mime, '', uploaded.url) : '';
+      const kind = picked.mime.startsWith('video/') ? 'video' : 'image';
+      const chip = uploaded.chipBytes ? holdPreview(uploaded.chipBytes, 'image/jpeg') : preview;
+      if (chip !== preview) releasePreview(preview);
       setDraft((prev) => {
-        if (prev && prev.preview && prev.preview !== preview) releasePreview(prev.preview);
-        return { url: uploaded.url, poster, preview, kind };
+        if (prev && prev.preview && prev.preview !== chip) releasePreview(prev.preview);
+        return { media: uploaded.media, preview: chip, kind };
       });
     } catch (e: unknown) {
       releasePreview(preview);
@@ -101,7 +100,7 @@ export function ChatScreen({ chat }: Props) {
         flash(MEDIA_BLOCKED);
         return;
       }
-      const res = await chat.send(text, draft?.url || '', draft?.poster || '');
+      const res = await chat.send(text, draft?.media ?? null);
       if (!res.ok) {
         flash(res.error || 'Send failed');
         return;
@@ -128,23 +127,27 @@ export function ChatScreen({ chat }: Props) {
   );
 
   const predictSend = useCallback(
-    (text: string) => sendOutgoingBytes(text, draft?.url || '', draft?.poster || ''),
+    (text: string) => sendOutgoingBytes(packFitting(text, draft?.media ?? null).packed),
     [draft]
   );
   const predictEdit = useCallback(
-    (text: string) =>
-      editing
-        ? editOutgoingBytes(
-            {
-              created: editing.created,
-              timestamp: formatStamp(editing.created),
-              image: editing.image || undefined,
-            },
-            text,
-            editing.image,
-            editing.poster
-          )
-        : 0,
+    (text: string) => {
+      if (!editing) return 0;
+      const fit = packFitting(
+        text,
+        editing.media,
+        editing.media ? '' : editing.image,
+        editing.media ? '' : editing.poster
+      );
+      return editOutgoingBytes(
+        {
+          created: editing.created,
+          timestamp: formatStamp(editing.created),
+          image: editing.media ? undefined : editing.image || undefined,
+        },
+        fit.packed
+      );
+    },
     [editing]
   );
 
@@ -219,7 +222,7 @@ export function ChatScreen({ chat }: Props) {
         editing={editing ? { label: formatStamp(editing.created), initialText: editing.text } : null}
         onSaveEdit={onSaveEdit}
         onCancelEdit={() => setEditing(null)}
-        attachment={draft ? { kind: draft.kind, preview: draft.kind === 'video' && draft.poster ? draft.poster : draft.preview } : null}
+        attachment={draft ? { kind: draft.kind, preview: draft.preview } : null}
         onAttach={onAttach}
         onClearAttachment={() => {
           releaseHeldMedia();

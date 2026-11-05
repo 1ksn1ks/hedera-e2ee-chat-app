@@ -33,11 +33,10 @@ import {
   editOutgoingBytes,
   HCS_MESSAGE_MAX_BYTES,
   HCS_TOO_LONG,
-  packChatPayload,
   sendOutgoingBytes,
-  unpackChatPayload,
   utf8ByteLength,
 } from '../services/chatPayload';
+import { packFitting, unpackChatPayload, type SealedMedia } from '../services/sealedMedia';
 import {
   decryptMessage,
   decryptWithPassword,
@@ -57,6 +56,7 @@ export interface Bubble {
   image: string;
   poster: string;
   legacyPlain: boolean;
+  media: SealedMedia | null;
   pending: boolean;
   edited: boolean;
   mine: boolean;
@@ -67,6 +67,7 @@ interface EditEntry {
   image: string;
   poster: string;
   legacyPlain: boolean;
+  media: SealedMedia | null;
   at: string;
 }
 
@@ -237,13 +238,14 @@ export function useE2eeChat() {
         return null; // no key for this topic / malformed ciphertext: reject
       }
       const text = typeof parts.text === 'string' ? parts.text : '';
-      // The image rides inside the sealed payload. data.image is only a
+      // A sealed file keeps its URL inside `m`. data.image is only a
       // fallback for edits that were already sent the old way
-      // (encryptedtopicchat.js:71-73).
-      const image = parts.image || (data.image ? String(data.image) : '');
-      const poster = parts.poster || '';
-      const legacyPlain = !!image && !poster;
-      if (!text && !image) return null;
+      // (encryptedtopicchat.js:71-73). The ciphertext URL is never painted.
+      const media = parts.media;
+      const image = media ? '' : parts.image || (data.image ? String(data.image) : '');
+      const poster = media ? '' : parts.poster || '';
+      const legacyPlain = media ? false : !!image && !poster;
+      if (!text && !image && !media) return null;
       const at = createdIso(envelope) || '';
       // An edit that names a bubble from its own future is malformed noise.
       if (created && at && at <= created) return null;
@@ -253,13 +255,13 @@ export function useE2eeChat() {
       if (!at && prev) return null;
       // Latest wins: an older edit arriving late never replaces a newer one.
       if (prev && prev.at && at && at < prev.at) return null;
-      const entry: EditEntry = { text, image, poster, legacyPlain, at };
+      const entry: EditEntry = { text, image, poster, legacyPlain, media, at };
       editsRef.current.set(mapKey, entry);
       // Rewrite the on-screen bubbles in place (+ the "edited" mark).
       setBubbles((bs) =>
         bs.map((b) =>
           b.payer === payer && b.created === created
-            ? { ...b, text, image, poster, legacyPlain, edited: true }
+            ? { ...b, text, image, poster, legacyPlain, media, edited: true }
             : b
         )
       );
@@ -300,7 +302,7 @@ export function useE2eeChat() {
       } catch {
         return; // wrong key / malformed ciphertext: no bubble
       }
-      if (!parts.text && !parts.image) return;
+      if (!parts.text && !parts.image && !parts.media) return;
       const created = createdIso(m.created) || new Date().toISOString();
       const sig = messageSig(m);
       const isPending = !!m.pending;
@@ -317,6 +319,7 @@ export function useE2eeChat() {
             image: parts.image,
             poster: parts.poster,
             legacyPlain: parts.legacyPlain,
+            media: parts.media,
             pending: isPending,
             created: isPending ? next[i].created : created,
             mine,
@@ -334,6 +337,7 @@ export function useE2eeChat() {
             image: parts.image,
             poster: parts.poster,
             legacyPlain: parts.legacyPlain,
+            media: parts.media,
             pending: isPending,
             edited,
             mine,
@@ -678,7 +682,7 @@ export function useE2eeChat() {
   // ── Send + edit (wallet-confirmed, 18 KB gated) ────────────────────────
 
   const send = useCallback(
-    async (text: string, imageUrl = '', poster = ''): Promise<Result> => {
+    async (text: string, media: SealedMedia | null = null): Promise<Result> => {
       const topic = topicIdRef.current;
       const pub = publicKeyRef.current;
       if (!topic) return { ok: false, error: 'No topic connected' };
@@ -687,22 +691,20 @@ export function useE2eeChat() {
       }
       const acc = (await getConnectedAccount()) || accountRef.current;
       if (!acc) return { ok: false, error: 'Connect a wallet to send (HBAR network fee only)' };
-      if (!String(text || '').trim() && !imageUrl) return { ok: false, error: 'Please enter a message.' };
+      if (!String(text || '').trim() && !media?.url) return { ok: false, error: 'Please enter a message.' };
       // Predict the exact outgoing size before encrypting (fixed 48-byte
-      // seal, unpadded base64). A still that does not fit is dropped, the
-      // same as encryptedtopicchat.js:1311-1314.
-      let still = poster;
-      let droppedPoster = false;
-      let predicted = sendOutgoingBytes(text, imageUrl, still);
-      if (still && predicted > HCS_MESSAGE_MAX_BYTES) {
-        still = '';
-        droppedPoster = true;
-        predicted = sendOutgoingBytes(text, imageUrl, still);
+      // seal, unpadded base64). An embedded still that does not fit is
+      // dropped. The ciphertext URL stays inside the sealed payload.
+      const fit = packFitting(text, media);
+      if (media?.url && !fit.packed.startsWith('\u001echat1\n')) {
+        return { ok: false, error: 'Upload failed' };
       }
+      const droppedPoster = fit.droppedPoster;
+      const predicted = sendOutgoingBytes(fit.packed);
       if (predicted > HCS_MESSAGE_MAX_BYTES) return { ok: false, error: HCS_TOO_LONG };
       try {
         // Encrypt before build: plaintext never enters the HCS JSON.
-        const encryptedMessage = await encryptMessage(packChatPayload(text, imageUrl, still), pub);
+        const encryptedMessage = await encryptMessage(fit.packed, pub);
         const outgoing = JSON.stringify({ encryptedMessage });
         // And measure the final JSON anyway — the ciphertext is the exact
         // length, so this can only ever disagree on a bug.
@@ -751,19 +753,22 @@ export function useE2eeChat() {
         created: bubble.created,
         timestamp: formatStamp(bubble.created),
       };
-      if (bubble.image) data.image = bubble.image;
-      const image = bubble.image || '';
-      let still = bubble.poster || '';
-      let droppedPoster = false;
-      let predicted = editOutgoingBytes(data, newText, image, still);
-      if (still && predicted > HCS_MESSAGE_MAX_BYTES) {
-        still = '';
-        droppedPoster = true;
-        predicted = editOutgoingBytes(data, newText, image, still);
+      // A sealed file does not copy its ciphertext URL onto the outer edit.
+      if (!bubble.media && bubble.image) data.image = bubble.image;
+      const fit = packFitting(
+        newText,
+        bubble.media,
+        bubble.media ? '' : bubble.image,
+        bubble.media ? '' : bubble.poster
+      );
+      if (bubble.media?.url && !fit.packed.startsWith('\u001echat1\n')) {
+        return { ok: false, error: 'Edit was not saved' };
       }
+      const droppedPoster = fit.droppedPoster;
+      const predicted = editOutgoingBytes(data, fit.packed);
       if (predicted > HCS_MESSAGE_MAX_BYTES) return { ok: false, error: HCS_TOO_LONG };
       try {
-        const encryptedMessage = await encryptMessage(packChatPayload(newText, image, still), pub);
+        const encryptedMessage = await encryptMessage(fit.packed, pub);
         const body: Record<string, unknown> = {
           created: data.created,
           timestamp: data.timestamp,
