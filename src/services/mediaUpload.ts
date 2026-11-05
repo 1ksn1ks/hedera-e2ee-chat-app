@@ -1,6 +1,8 @@
-// Previews stay in memory. The ciphertext upload lives in sealedMedia.ts.
-// A picked name is never read. Revoke runs on chat close and logout.
+// Previews stay in memory on the web. Native decrypted files live in the
+// app cache directory and are deleted on chat close and logout. A picked
+// name is never read. Nothing here writes the gallery.
 // The base URL matches backend.ts (default onlyonhbar.com).
+import { NativeModules } from 'react-native';
 
 export const MEDIA_BLOCKED = 'Media is off on Direct Hedera — no server to hold files.';
 
@@ -8,7 +10,76 @@ export const MEDIA_BLOCKED = 'Media is off on Direct Hedera — no server to hol
 const VIDEO_URL = /\.(mp4|webm|mov|m4v)(?=$|[?#])/i;
 
 const held = new Set<string>();
+const heldFiles = new Set<string>();
 const releaseListeners = new Set<() => void>();
+
+type CacheMediaNative = {
+  append(name: string, base64: string, append: boolean): Promise<string>;
+  remove(uri: string): Promise<void>;
+  clear(): Promise<void>;
+};
+
+function cacheMedia(): CacheMediaNative | null {
+  const mod = (NativeModules as { CacheMedia?: CacheMediaNative } | undefined)?.CacheMedia;
+  if (!mod || typeof mod.append !== 'function' || typeof mod.clear !== 'function') return null;
+  return mod;
+}
+
+function cacheExtension(mime: string): string {
+  if (mime === 'image/png') return 'png';
+  if (mime === 'image/webp') return 'webp';
+  if (mime === 'image/jpeg') return 'jpg';
+  if (mime === 'video/webm') return 'webm';
+  if (mime === 'video/mp4') return 'mp4';
+  return 'bin';
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
+// App cache only. The native module refuses a name that leaves that directory.
+export async function holdCacheFile(bytes: Uint8Array, mime: string): Promise<string> {
+  const mod = cacheMedia();
+  if (!mod) throw new Error('decrypt');
+  const alphabet = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  let id = '';
+  for (let i = 0; i < 12; i += 1) id += alphabet[Math.floor(Math.random() * alphabet.length)];
+  const name = `${id}.${cacheExtension(mime)}`;
+  const piece = 48 * 1024;
+  let uri = '';
+  if (bytes.byteLength === 0) uri = await mod.append(name, '', false);
+  for (let i = 0; i < bytes.byteLength; i += piece) {
+    const slice = bytes.subarray(i, Math.min(bytes.byteLength, i + piece));
+    uri = await mod.append(name, bytesToBase64(slice), i > 0);
+  }
+  if (!uri.startsWith('file:')) throw new Error('decrypt');
+  heldFiles.add(uri);
+  return uri;
+}
+
+function dropCacheFile(uri: string): void {
+  heldFiles.delete(uri);
+  const mod = cacheMedia();
+  if (!mod || typeof mod.remove !== 'function') return;
+  mod.remove(uri).catch(() => {
+    // Already deleted.
+  });
+}
+
+function dropCacheFiles(): void {
+  heldFiles.clear();
+  const mod = cacheMedia();
+  if (!mod) return;
+  mod.clear().catch(() => {
+    // The directory is already gone.
+  });
+}
 
 function relayBase(): string {
   const configured = (globalThis as { __E2EE_BACKEND_URL__?: string }).__E2EE_BACKEND_URL__;
@@ -43,7 +114,12 @@ export function holdPreview(bytes: Uint8Array, mime: string): string {
 }
 
 export function releasePreview(url: string): void {
-  if (!url || !held.has(url)) return;
+  if (!url) return;
+  if (heldFiles.has(url)) {
+    dropCacheFile(url);
+    return;
+  }
+  if (!held.has(url)) return;
   held.delete(url);
   if (typeof URL === 'undefined') return;
   try {
@@ -71,6 +147,7 @@ export function releaseHeldMedia(): void {
     }
   }
   held.clear();
+  dropCacheFiles();
   for (const listener of releaseListeners) listener();
 }
 

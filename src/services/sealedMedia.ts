@@ -110,8 +110,9 @@ interface DownloadBody {
 
 interface DownloadResponse {
   ok: boolean;
-  body: DownloadBody | null;
+  body?: DownloadBody | null;
   headers?: { get(name: string): string | null } | null;
+  arrayBuffer?: () => Promise<ArrayBuffer>;
 }
 
 export type SealedDownloadFetch = (
@@ -168,7 +169,27 @@ function concat(left: Uint8Array, right: Uint8Array): Uint8Array<ArrayBuffer> {
   return out;
 }
 
-function readerOf(source: Blob | Uint8Array | DownloadBody | null | undefined): ByteReader {
+// Walk a buffer in STREAM_CHUNK slices. React Native's Blob has no stream(),
+// and new Blob([bytes]) throws, so this path never builds one.
+function readerFromBytes(bytes: Uint8Array): ByteReader {
+  let offset = 0;
+  return {
+    async read() {
+      if (offset >= bytes.byteLength) return { done: true };
+      const end = Math.min(bytes.byteLength, offset + STREAM_CHUNK);
+      const value = bytes.subarray(offset, end);
+      offset = end;
+      return { done: false, value };
+    },
+    cancel() {
+      offset = bytes.byteLength;
+    },
+  };
+}
+
+function readerOf(source: Blob | Uint8Array | ArrayBuffer | DownloadBody | null | undefined): ByteReader {
+  if (source instanceof Uint8Array) return readerFromBytes(source);
+  if (source instanceof ArrayBuffer) return readerFromBytes(new Uint8Array(source));
   const streamBody = source as { getReader?: () => ByteReader; body?: { getReader?: () => ByteReader } } | null;
   if (streamBody && typeof streamBody.getReader === 'function') return streamBody.getReader();
   if (streamBody && streamBody.body && typeof streamBody.body.getReader === 'function') {
@@ -176,8 +197,19 @@ function readerOf(source: Blob | Uint8Array | DownloadBody | null | undefined): 
   }
   const asBlob = source as Blob | null;
   if (asBlob && typeof asBlob.stream === 'function') return asBlob.stream().getReader() as ByteReader;
-  const bytes = source instanceof Uint8Array ? source : new Uint8Array(0);
-  return blobOf([bytes]).stream().getReader() as ByteReader;
+  if (asBlob && typeof asBlob.arrayBuffer === 'function') {
+    let inner: ByteReader | null = null;
+    return {
+      async read() {
+        if (!inner) inner = readerFromBytes(new Uint8Array(await asBlob.arrayBuffer()));
+        return inner.read();
+      },
+      cancel() {
+        return inner?.cancel?.();
+      },
+    };
+  }
+  return readerFromBytes(new Uint8Array(0));
 }
 
 function plainSizeOf(source: Blob | Uint8Array): number {
@@ -553,7 +585,7 @@ async function fetchSealed(
   url: string,
   cap: number,
   fetchImpl: SealedDownloadFetch
-): Promise<{ body: DownloadBody; stop: () => void }> {
+): Promise<{ source: DownloadBody | Uint8Array; stop: () => void }> {
   const controller = new AbortController();
   const stop = () => {
     try {
@@ -573,7 +605,7 @@ async function fetchSealed(
     stop();
     throw new Error('decrypt');
   }
-  if (!response || !response.ok || !response.body) {
+  if (!response || !response.ok) {
     stop();
     throw new Error('decrypt');
   }
@@ -581,21 +613,50 @@ async function fetchSealed(
   if (announced > cap) {
     stop();
     try {
-      await response.body.cancel?.();
+      await response.body?.cancel?.();
     } catch {
       // Unread.
     }
     throw new Error('decrypt');
   }
-  return { body: response.body, stop };
+  const stream = response.body;
+  if (stream && typeof stream.getReader === 'function') return { source: stream, stop };
+  if (typeof response.arrayBuffer !== 'function') {
+    stop();
+    throw new Error('decrypt');
+  }
+  let raw: ArrayBuffer;
+  try {
+    raw = await response.arrayBuffer();
+  } catch {
+    stop();
+    throw new Error('decrypt');
+  }
+  if (raw.byteLength > cap) {
+    stop();
+    throw new Error('decrypt');
+  }
+  return { source: new Uint8Array(raw), stop };
 }
 
-export async function decryptStream(
-  source: Blob | Uint8Array | DownloadBody,
+function plaintextBytes(parts: Uint8Array[]): Uint8Array<ArrayBuffer> {
+  let size = 0;
+  for (const part of parts) size += part.byteLength;
+  const out = new Uint8Array(new ArrayBuffer(size));
+  let offset = 0;
+  for (const part of parts) {
+    out.set(part, offset);
+    offset += part.byteLength;
+  }
+  return out;
+}
+
+async function decryptFrames(
+  source: Blob | Uint8Array | ArrayBuffer | DownloadBody,
   fileKeyB64: string,
   headerB64: string,
-  cap: number = SEALED_MAX
-): Promise<Blob> {
+  cap: number
+): Promise<Uint8Array<ArrayBuffer>> {
   await sealedReady();
   const key = sodium.from_base64(fileKeyB64);
   const header = sodium.from_base64(headerB64);
@@ -644,10 +705,21 @@ export async function decryptStream(
     throw new Error('decrypt');
   }
   if (!sawFinal) throw new Error('decrypt');
-  return blobOf(parts);
+  return plaintextBytes(parts);
 }
 
-export async function decryptSealedPart(
+export async function decryptStream(
+  source: Blob | Uint8Array | ArrayBuffer | DownloadBody,
+  fileKeyB64: string,
+  headerB64: string,
+  cap: number = SEALED_MAX
+): Promise<Blob> {
+  return blobOf([await decryptFrames(source, fileKeyB64, headerB64, cap)]);
+}
+
+// Plaintext bytes. Native uses this directly: React Native cannot build a
+// Blob from those bytes, and its fetch response has no body stream.
+export async function decryptSealedBytes(
   part: {
     url?: string;
     b64?: string;
@@ -657,7 +729,7 @@ export async function decryptSealedPart(
     size?: number;
   },
   fetchImpl?: SealedDownloadFetch
-): Promise<Blob> {
+): Promise<Uint8Array<ArrayBuffer>> {
   await sealedReady();
   if (!part.fileKey || !part.header) throw new Error('decrypt');
   const cap = sealedDownloadCap(part.size);
@@ -672,7 +744,7 @@ export async function decryptSealedPart(
         throw new Error('decrypt');
       }
       if (!raw.length || raw.byteLength > cap) throw new Error('decrypt');
-      source = blobOf([raw]);
+      source = raw;
     } else {
       const href = sealedMediaUrl(part.url || '');
       if (!href) throw new Error('decrypt');
@@ -682,12 +754,9 @@ export async function decryptSealedPart(
         fetchImpl ?? ((url, init) => fetch(url, init) as Promise<DownloadResponse>)
       );
       stop = opened.stop;
-      source = opened.body;
+      source = opened.source;
     }
-    const plain = await decryptStream(source, part.fileKey, part.header, cap);
-    const type = typeof part.mime === 'string' && part.mime ? part.mime : SEALED_CONTENT_TYPE;
-    const bytes = new Uint8Array(await plain.arrayBuffer());
-    return blobOf([bytes], type);
+    return await decryptFrames(source, part.fileKey, part.header, cap);
   } catch (err) {
     try {
       stop();
@@ -697,6 +766,22 @@ export async function decryptSealedPart(
     if (err instanceof Error && err.message === 'decrypt') throw err;
     throw new Error('decrypt');
   }
+}
+
+export async function decryptSealedPart(
+  part: {
+    url?: string;
+    b64?: string;
+    fileKey: string;
+    header: string;
+    mime?: string;
+    size?: number;
+  },
+  fetchImpl?: SealedDownloadFetch
+): Promise<Blob> {
+  const bytes = await decryptSealedBytes(part, fetchImpl);
+  const type = typeof part.mime === 'string' && part.mime ? part.mime : SEALED_CONTENT_TYPE;
+  return blobOf([bytes], type);
 }
 
 export async function sealPosterBytes(

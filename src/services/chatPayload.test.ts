@@ -492,3 +492,96 @@ test('an oversized body is aborted', async () => {
   assert.ok(streamed <= cap + 2);
   assert.ok(streamed < total);
 });
+
+test('a ciphertext with no response body and no Blob.stream still decrypts', async () => {
+  await sealedReady();
+  const plain = new Uint8Array(STREAM_CHUNK + 10);
+  for (let i = 0; i < plain.length; i += 1) plain[i] = i & 255;
+  const enc = await encryptStream(plain);
+  const cipher = new Uint8Array(await enc.blob.arrayBuffer());
+  const realStream = Blob.prototype.stream;
+  Blob.prototype.stream = function stream() {
+    throw new Error('stream');
+  };
+  try {
+    const fromBytes = await decryptStream(cipher, enc.fileKey, enc.header, plain.byteLength + 64);
+    assert.deepEqual(new Uint8Array(await fromBytes.arrayBuffer()), plain);
+
+    const good = `${MEDIA_ORIGIN}/markers/1700000000000-nostream`;
+    let buffered = 0;
+    const opened = await decryptSealedPart(
+      {
+        url: good,
+        fileKey: enc.fileKey,
+        header: enc.header,
+        mime: 'image/jpeg',
+        size: plain.byteLength,
+      },
+      async (_url, init) => {
+        assert.equal(init.redirect, 'error');
+        assert.equal(init.credentials, 'omit');
+        return {
+          ok: true,
+          body: null,
+          headers: { get: () => null },
+          arrayBuffer: async () => {
+            buffered += 1;
+            return cipher.buffer.slice(cipher.byteOffset, cipher.byteOffset + cipher.byteLength);
+          },
+        };
+      }
+    );
+    assert.equal(buffered, 1);
+    assert.deepEqual(new Uint8Array(await opened.arrayBuffer()), plain);
+
+    let skipped = 0;
+    await assert.rejects(
+      () =>
+        decryptSealedPart(
+          {
+            url: good,
+            fileKey: enc.fileKey,
+            header: enc.header,
+            size: plain.byteLength,
+          },
+          async () => ({
+            ok: true,
+            body: null,
+            headers: {
+              get(name: string) {
+                return String(name).toLowerCase() === 'content-length' ? String(SEALED_MAX + 1) : null;
+              },
+            },
+            arrayBuffer: async () => {
+              skipped += 1;
+              return cipher.buffer.slice(cipher.byteOffset, cipher.byteOffset + cipher.byteLength);
+            },
+          })
+        ),
+      (err: unknown) => err instanceof Error && err.message === 'decrypt'
+    );
+    assert.equal(skipped, 0);
+
+    const cap = sealedDownloadCap(plain.byteLength);
+    await assert.rejects(
+      () =>
+        decryptSealedPart(
+          {
+            url: good,
+            fileKey: enc.fileKey,
+            header: enc.header,
+            size: plain.byteLength,
+          },
+          async () => ({
+            ok: true,
+            body: null,
+            headers: { get: () => null },
+            arrayBuffer: async () => new Uint8Array(cap + 8).buffer,
+          })
+        ),
+      (err: unknown) => err instanceof Error && err.message === 'decrypt'
+    );
+  } finally {
+    Blob.prototype.stream = realStream;
+  }
+});

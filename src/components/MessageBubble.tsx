@@ -11,7 +11,9 @@ import {
   StyleSheet,
   Text,
   View,
+  requireNativeComponent,
   type GestureResponderEvent,
+  type ViewStyle,
 } from 'react-native';
 import { colors, glassCard, radius } from '../theme';
 import { Bubble } from '../hooks/useE2eeChat';
@@ -30,6 +32,16 @@ interface Props {
 }
 
 type OpenPart = { url?: string; b64?: string; fileKey: string; header: string; mime?: string; size?: number };
+
+type SealedVideoProps = { src: string; style?: ViewStyle };
+
+let SealedVideo: React.ComponentType<SealedVideoProps> | null = null;
+
+function NativeClip({ src, style }: SealedVideoProps) {
+  if (!SealedVideo) SealedVideo = requireNativeComponent<SealedVideoProps>('SealedVideo');
+  const Clip = SealedVideo;
+  return <Clip src={src} style={style} />;
+}
 
 function partKey(part: OpenPart | null): string {
   if (!part || !part.fileKey || !part.header) return '';
@@ -92,8 +104,7 @@ function MediaFrame({ bubble }: { bubble: Bubble }) {
   const [broken, setBroken] = useState(false);
   const poster = useMemoryUrl(usable && sealed?.poster ? posterPart(sealed.poster) : null);
   const still = useMemoryUrl(usable && sealed && !video ? sealed : null);
-  const inlineVideo = typeof document !== 'undefined';
-  const clip = useMemoryUrl(usable && sealed && video && playing && inlineVideo ? sealed : null);
+  const clip = useMemoryUrl(usable && sealed && video && playing ? sealed : null);
   const legacy = bubble.legacyPlain ? <Text style={styles.legacy}>unencrypted (old)</Text> : null;
   if (!sealed && !bubble.image && !bubble.poster) return null;
   const failed =
@@ -135,7 +146,6 @@ function MediaFrame({ bubble }: { bubble: Bubble }) {
           <View style={styles.playOverlay} pointerEvents="box-none">
             <Pressable
               onPress={() => {
-                if (sealed && !inlineVideo) return;
                 setPlaying(true);
               }}
               style={styles.play}
@@ -178,13 +188,7 @@ function Playable({
   memory?: boolean;
 }) {
   if (typeof document === 'undefined') {
-    if (memory) {
-      return (
-        <View style={styles.failBox}>
-          <Text style={styles.fail}>Play</Text>
-        </View>
-      );
-    }
+    if (memory) return <NativeClip src={uri} style={styles.image} />;
     return (
       <Pressable onPress={() => Linking.openURL(uri)} style={styles.failBox} accessibilityRole="button">
         <Text style={styles.fail}>Play</Text>

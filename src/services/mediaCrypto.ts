@@ -6,6 +6,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { HCS_MESSAGE_MAX_BYTES } from './chatPayload';
 import {
+  holdCacheFile,
   holdPreview,
   relayUploadBase,
 } from './mediaUpload';
@@ -20,6 +21,7 @@ import {
   type SealedMedia,
   type SealedPoster,
   type UploadGrant,
+  decryptSealedBytes,
   decryptSealedPart,
 } from './sealedMedia';
 import { signUploadNonce } from './wallet';
@@ -50,15 +52,6 @@ function evenFloor(n: number): number {
   const v = Math.floor(Number(n) || 0);
   const even = v - (v % 2);
   return even < 2 ? 2 : even;
-}
-
-function bytesToBase64(bytes: Uint8Array): string {
-  let binary = '';
-  const chunk = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunk) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
-  }
-  return btoa(binary);
 }
 
 function dataUrlBytes(dataUrl: string): Uint8Array | null {
@@ -300,8 +293,8 @@ export async function uploadChatMedia(options: {
   return { media, chipBytes };
 }
 
-// Decrypt one sealed part into a memory URL. Web uses a blob URL revoked
-// with the other previews. Native keeps a data URL in JS and never a file.
+// Decrypt one sealed part. Web keeps a blob URL. Native writes a file in
+// the app cache (deleted on chat close and logout) and never a data: URL.
 export async function openSealedPart(part: {
   url?: string;
   b64?: string;
@@ -310,9 +303,12 @@ export async function openSealedPart(part: {
   mime?: string;
   size?: number;
 }): Promise<string> {
+  const mime = part.mime || 'application/octet-stream';
+  if (typeof document === 'undefined') {
+    const bytes = await decryptSealedBytes(part);
+    return holdCacheFile(bytes, mime);
+  }
   const blob = await decryptSealedPart(part);
   const bytes = new Uint8Array(await blob.arrayBuffer());
-  const mime = part.mime || 'application/octet-stream';
-  if (typeof document === 'undefined') return `data:${mime};base64,${bytesToBase64(bytes)}`;
   return holdPreview(bytes, mime);
 }
