@@ -3,7 +3,7 @@
 // showAvatar), own bubbles sit right with the cyan tint, the stamp is
 // dd/mm/yy HH:MM, and a live edit rewrites text in place with an "edited"
 // mark. Long-press on an OWN confirmed bubble offers Edit.
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState, type RefObject } from 'react';
 import {
   Image,
   Linking,
@@ -17,6 +17,7 @@ import {
 } from 'react-native';
 import { colors, glassCard, radius } from '../theme';
 import { Bubble } from '../hooks/useE2eeChat';
+import { decryptGate } from '../services/decryptSlots';
 import { isVideoUrl, onMediaReleased, openSealedPart, releasePreview } from '../services/mediaCrypto';
 import type { SealedPoster } from '../services/sealedMedia';
 
@@ -29,6 +30,8 @@ interface Props {
   stamp: string;
   canEdit: boolean;
   onEdit: (bubble: Bubble) => void;
+  /** Native list signal. Web uses IntersectionObserver and ignores this. */
+  near: boolean;
 }
 
 type OpenPart = { url?: string; b64?: string; fileKey: string; header: string; mime?: string; size?: number };
@@ -49,8 +52,11 @@ function partKey(part: OpenPart | null): string {
   return `${part.fileKey}|${part.header}|${part.url || ''}|${part.b64 ? 'b' : ''}|${part.mime || ''}`;
 }
 
-// Decrypt into a memory URL. Logout and chat close revoke it.
-function useMemoryUrl(part: OpenPart | null): { uri: string; failed: boolean } {
+// Decrypt into a memory URL only while the bubble is near the screen.
+// Logout, chat close, and scrolling far away revoke it. At most two
+// decrypts run at once (decryptGate). A queued one is dropped if the
+// bubble leaves before its turn.
+function useMemoryUrl(part: OpenPart | null, near: boolean): { uri: string; failed: boolean } {
   const [uri, setUri] = useState('');
   const [failed, setFailed] = useState(false);
   const partRef = useRef(part);
@@ -59,7 +65,7 @@ function useMemoryUrl(part: OpenPart | null): { uri: string; failed: boolean } {
   useEffect(() => onMediaReleased(() => setUri('')), []);
   useEffect(() => {
     const current = partRef.current;
-    if (!key || !current) {
+    if (!near || !key || !current) {
       setUri('');
       setFailed(false);
       return;
@@ -67,7 +73,8 @@ function useMemoryUrl(part: OpenPart | null): { uri: string; failed: boolean } {
     let dead = false;
     let opened = '';
     setFailed(false);
-    openSealedPart(current).then(
+    const job = decryptGate.run(() => openSealedPart(current));
+    job.promise.then(
       (next) => {
         if (dead) {
           releasePreview(next);
@@ -82,10 +89,56 @@ function useMemoryUrl(part: OpenPart | null): { uri: string; failed: boolean } {
     );
     return () => {
       dead = true;
+      job.cancel();
       if (opened) releasePreview(opened);
     };
-  }, [key]);
+  }, [key, near]);
   return { uri, failed };
+}
+
+// Web: one viewport above and below (rootMargin percentages are of the root).
+// Native has no IntersectionObserver, so the FlatList `near` flag is used.
+function useBubbleNear(hostRef: RefObject<View | null>, listNear: boolean): boolean {
+  const [mode, setMode] = useState<'pending' | 'web' | 'list'>(
+    typeof IntersectionObserver === 'function' ? 'pending' : 'list'
+  );
+  const [hit, setHit] = useState(false);
+  useEffect(() => {
+    if (typeof IntersectionObserver !== 'function') {
+      setMode('list');
+      return;
+    }
+    const node = hostRef.current as unknown as Element | null;
+    if (!node || typeof node.getBoundingClientRect !== 'function') {
+      setMode('list');
+      return;
+    }
+    let observer: IntersectionObserver | null = null;
+    let dead = false;
+    try {
+      observer = new IntersectionObserver(
+        (entries) => {
+          if (dead) return;
+          const entry = entries[entries.length - 1];
+          setHit(!!entry && entry.isIntersecting);
+          setMode('web');
+        },
+        { root: null, rootMargin: '100% 0px', threshold: 0 }
+      );
+      observer.observe(node);
+    } catch {
+      observer?.disconnect();
+      setMode('list');
+      return;
+    }
+    return () => {
+      dead = true;
+      observer?.disconnect();
+    };
+  }, [hostRef]);
+  if (mode === 'web') return hit;
+  if (mode === 'list') return listNear;
+  return false;
 }
 
 function posterPart(poster: SealedPoster | undefined): OpenPart | null {
@@ -96,15 +149,15 @@ function posterPart(poster: SealedPoster | undefined): OpenPart | null {
 
 // A sealed file decrypts in memory. An old {t,i} link stays a clear URL
 // and is labelled "unencrypted (old)". A failure says "Can't decrypt".
-function MediaFrame({ bubble }: { bubble: Bubble }) {
+function MediaFrame({ bubble, near }: { bubble: Bubble; near: boolean }) {
   const sealed = bubble.media;
   const usable = !!(sealed && sealed.fileKey && sealed.header && sealed.url);
   const video = sealed ? sealed.mime.startsWith('video/') : isVideoUrl(bubble.image);
   const [playing, setPlaying] = useState(false);
   const [broken, setBroken] = useState(false);
-  const poster = useMemoryUrl(usable && sealed?.poster ? posterPart(sealed.poster) : null);
-  const still = useMemoryUrl(usable && sealed && !video ? sealed : null);
-  const clip = useMemoryUrl(usable && sealed && video && playing ? sealed : null);
+  const poster = useMemoryUrl(usable && sealed?.poster ? posterPart(sealed.poster) : null, near);
+  const still = useMemoryUrl(usable && sealed && !video ? sealed : null, near);
+  const clip = useMemoryUrl(usable && sealed && video && playing ? sealed : null, near);
   const legacy = bubble.legacyPlain ? <Text style={styles.legacy}>unencrypted (old)</Text> : null;
   if (!sealed && !bubble.image && !bubble.poster) return null;
   const failed =
@@ -213,8 +266,10 @@ function Playable({
   });
 }
 
-export function MessageBubble({ bubble, showAvatar, showHeader, stamp, canEdit, onEdit }: Props) {
+export function MessageBubble({ bubble, showAvatar, showHeader, stamp, canEdit, onEdit, near }: Props) {
   const [expanded, setExpanded] = useState(false);
+  const hostRef = useRef<View>(null);
+  const onScreen = useBubbleNear(hostRef, near);
   const mine = bubble.mine;
   const long = bubble.text.length > 400;
 
@@ -224,6 +279,7 @@ export function MessageBubble({ bubble, showAvatar, showHeader, stamp, canEdit, 
 
   return (
     <View
+      ref={hostRef}
       style={[
         styles.row,
         mine && styles.rowMine,
@@ -264,7 +320,7 @@ export function MessageBubble({ bubble, showAvatar, showHeader, stamp, canEdit, 
               {expanded ? bubble.text : long ? bubble.text.slice(0, 400) : bubble.text}
             </Text>
           ) : null}
-          <MediaFrame bubble={bubble} />
+          <MediaFrame bubble={bubble} near={onScreen} />
           {long && (
             <Pressable onPress={() => setExpanded((v) => !v)}>
               <Text style={styles.more}>{expanded ? 'Show less' : 'Show more'}</Text>

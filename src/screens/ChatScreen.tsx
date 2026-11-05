@@ -11,12 +11,14 @@ import {
   Text,
   View,
 } from 'react-native';
+import type { ViewToken } from '@react-native/virtualized-lists';
 import { baseStyles, colors, glassCard } from '../theme';
 import { Bubble, formatStamp, type E2eeChat } from '../hooks/useE2eeChat';
 import { MessageBubble } from '../components/MessageBubble';
 import { Composer } from '../components/Composer';
 import { RelayStatus } from '../components/RelayStatus';
 import { editOutgoingBytes, sendOutgoingBytes } from '../services/chatPayload';
+import { nearKeysForView } from '../services/decryptSlots';
 import { packFitting, type SealedMedia } from '../services/sealedMedia';
 import {
   holdPreview,
@@ -49,6 +51,9 @@ export function ChatScreen({ chat }: Props) {
   const [draft, setDraft] = useState<DraftMedia | null>(null);
   const [attachBusy, setAttachBusy] = useState(false);
   const listRef = useRef<FlatList<Row>>(null);
+  const [nearKeys, setNearKeys] = useState<Set<string>>(() => new Set());
+  const nearKeysRef = useRef(nearKeys);
+  nearKeysRef.current = nearKeys;
 
   const topic = chat.meta?.topicId || '';
 
@@ -161,6 +166,29 @@ export function ChatScreen({ chat }: Props) {
       }),
     [chat.bubbles]
   );
+  const rowsRef = useRef(rows);
+  rowsRef.current = rows;
+
+  // Stable pair: FlatList ignores a changed onViewableItemsChanged.
+  // The visible span plus one span above and below is about one screen
+  // outside the viewport. Web bubbles ignore this and use IntersectionObserver.
+  const viewabilityConfig = useRef({
+    itemVisiblePercentThreshold: 0,
+    minimumViewTime: 0,
+  }).current;
+  const onViewableItemsChanged = useRef(
+    ({ viewableItems }: { viewableItems: Array<ViewToken<Row>> }) => {
+      const nextKeys = nearKeysForView(
+        rowsRef.current.map((row) => ({ key: row.bubble.sig })),
+        viewableItems
+      );
+      const prev = nearKeysRef.current;
+      if (prev.size === nextKeys.length && nextKeys.every((key) => prev.has(key))) return;
+      const next = new Set(nextKeys);
+      nearKeysRef.current = next;
+      setNearKeys(next);
+    }
+  ).current;
 
   const composerDisabled = !chat.account || chat.unlock.status !== 'unlocked';
 
@@ -187,9 +215,12 @@ export function ChatScreen({ chat }: Props) {
       <FlatList<Row>
         ref={listRef}
         data={rows}
+        extraData={nearKeys}
         keyExtractor={(r) => r.bubble.sig}
         inverted={false}
         contentContainerStyle={styles.list}
+        viewabilityConfig={viewabilityConfig}
+        onViewableItemsChanged={onViewableItemsChanged}
         onContentSizeChange={() => listRef.current?.scrollToOffset({ offset: 0, animated: false })}
         renderItem={({ item }) => (
           <MessageBubble
@@ -199,6 +230,7 @@ export function ChatScreen({ chat }: Props) {
             stamp={formatStamp(item.bubble.created)}
             canEdit={item.bubble.mine}
             onEdit={(b) => setEditing(b)}
+            near={nearKeys.has(item.bubble.sig)}
           />
         )}
         ListEmptyComponent={

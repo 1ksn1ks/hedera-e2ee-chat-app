@@ -6,6 +6,7 @@ import { test } from 'node:test';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { sendOutgoingBytes } from './chatPayload.ts';
+import { createDecryptGate, nearKeysForView } from './decryptSlots.ts';
 import {
   SEALED_MAX,
   STREAM_CHUNK,
@@ -584,4 +585,84 @@ test('a ciphertext with no response body and no Blob.stream still decrypts', asy
   } finally {
     Blob.prototype.stream = realStream;
   }
+});
+
+test('sealed stills decrypt only near the screen, two at a time', async () => {
+  const bubble = readFileSync(new URL('../components/MessageBubble.tsx', import.meta.url), 'utf8');
+  const screen = readFileSync(new URL('../screens/ChatScreen.tsx', import.meta.url), 'utf8');
+  assert.match(bubble, /IntersectionObserver/);
+  assert.match(bubble, /rootMargin: '100% 0px'/);
+  assert.match(bubble, /decryptGate\.run/);
+  assert.match(bubble, /posterEmpty/);
+  assert.match(screen, /onViewableItemsChanged/);
+  assert.match(screen, /nearKeysForView/);
+
+  const rows = Array.from({ length: 20 }, (_, i) => ({ key: `k${i}` }));
+  assert.deepEqual(
+    nearKeysForView(rows, [
+      { index: 8, isViewable: true },
+      { index: 9, isViewable: true },
+      { index: 10, isViewable: true },
+    ]),
+    ['k5', 'k6', 'k7', 'k8', 'k9', 'k10', 'k11', 'k12', 'k13']
+  );
+  assert.deepEqual(nearKeysForView(rows, []), []);
+  assert.deepEqual(nearKeysForView(rows, [{ index: 0, isViewable: true }]), ['k0', 'k1']);
+  assert.deepEqual(nearKeysForView(rows, [{ index: 19, isViewable: true }]), ['k18', 'k19']);
+  assert.deepEqual(
+    nearKeysForView(rows, [
+      { index: 4, isViewable: false },
+      { index: 5, isViewable: true },
+    ]),
+    ['k4', 'k5', 'k6']
+  );
+
+  const gate = createDecryptGate(2);
+  let started = 0;
+  const release: Array<() => void> = [];
+  const hang = () => {
+    started += 1;
+    return new Promise<number>((resolve) => {
+      const n = started;
+      release.push(() => resolve(n));
+    });
+  };
+  const first = gate.run(hang);
+  const second = gate.run(hang);
+  const third = gate.run(hang);
+  assert.equal(started, 2);
+  assert.equal(gate.inFlight(), 2);
+  assert.equal(gate.queued(), 1);
+  const dropped = third.promise.then(
+    () => 'ran',
+    (err: unknown) => (err instanceof Error ? err.message : 'bad')
+  );
+  assert.equal(third.cancel(), true);
+  assert.equal(await dropped, 'cancelled');
+  assert.equal(started, 2);
+  assert.equal(gate.queued(), 0);
+  assert.equal(gate.inFlight(), 2);
+  assert.equal(first.cancel(), false);
+  assert.equal(started, 2);
+
+  release[0]();
+  assert.equal(await first.promise, 1);
+  assert.equal(gate.inFlight(), 1);
+  assert.equal(started, 2);
+
+  const fourth = gate.run(hang);
+  assert.equal(started, 3);
+  assert.equal(gate.inFlight(), 2);
+  const fifth = gate.run(hang);
+  assert.equal(started, 3);
+  assert.equal(gate.queued(), 1);
+  release[1]();
+  assert.equal(await second.promise, 2);
+  assert.equal(started, 4);
+  release[2]();
+  release[3]();
+  assert.equal(await fourth.promise, 3);
+  assert.equal(await fifth.promise, 4);
+  assert.equal(gate.inFlight(), 0);
+  assert.equal(gate.queued(), 0);
 });
