@@ -27,14 +27,17 @@ jobs:
       APP_VERSION_CODE: ${{ github.run_number }}
       APP_VERSION_NAME: 0.1.${{ github.run_number }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      # Node 24 / npm 11, the same as the dev machine: the lockfile leaves out
+      # nested WalletConnect copies of async-storage, which npm 11 accepts and
+      # npm 10 (Node 22) rejects in npm ci.
+      - uses: actions/setup-node@v5
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 17
