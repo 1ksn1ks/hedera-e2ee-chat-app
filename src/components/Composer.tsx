@@ -7,14 +7,20 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import {
   Image,
+  Platform,
   Pressable,
   StyleSheet,
   Text,
   TextInput,
   View,
 } from 'react-native';
-import { colors, glassCard, radius } from '../theme';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { colors, noWebOutline, radius } from '../theme';
 import { formatHcsUsage, HCS_SHOW_COUNTER_AFTER } from '../services/chatPayload';
+import { Icon } from './Icon';
+
+const INPUT_MIN = 42;
+const INPUT_MAX = 140;
 
 interface Props {
   placeholder: string;
@@ -49,6 +55,15 @@ export function Composer({
   mediaNote,
 }: Props) {
   const [text, setText] = useState('');
+  const [focused, setFocused] = useState(false);
+  // Browser textareas don't grow by themselves: start at one row and follow
+  // the content height up to the cap. Phones grow natively.
+  const [webHeight, setWebHeight] = useState(INPUT_MIN);
+  const insets = useSafeAreaInsets();
+
+  useEffect(() => {
+    if (!text) setWebHeight(INPUT_MIN);
+  }, [text]);
 
   // Edit mode prefills the draft with the bubble's shown text; leaving edit
   // mode clears it.
@@ -83,83 +98,129 @@ export function Composer({
     }
   };
 
+  const attachOff = disabled || busy || !!mediaNote;
+  const showStatus = (showCounter && !!usage) || busy || over;
+
   return (
-    <View style={[styles.wrap, glassCard, { borderRadius: radius.sheet }]}>
-      {editing && (
-        <View style={styles.editBar}>
-          <Text style={styles.editLabel} numberOfLines={1}>
-            Edit — {editing.label}
-          </Text>
-          <Pressable hitSlop={8} onPress={onCancelEdit}>
-            <Text style={styles.cancelText}>Cancel</Text>
-          </Pressable>
-        </View>
-      )}
-      {mediaNote ? <Text style={styles.mediaNote}>{mediaNote}</Text> : null}
-      {hasMedia && attachment ? (
-        <View style={styles.draft}>
-          {attachment.preview ? (
-            <Image source={{ uri: attachment.preview }} style={styles.thumb} />
-          ) : (
-            <View style={styles.thumb} />
-          )}
-          <Text style={styles.draftLabel}>{attachment.kind === 'video' ? 'Video' : 'Photo'}</Text>
-          <Pressable hitSlop={8} onPress={onClearAttachment} accessibilityRole="button">
-            <Text style={styles.cancelText}>Remove</Text>
-          </Pressable>
-        </View>
-      ) : null}
-      <View style={styles.row}>
-        {!editing && onAttach ? (
-          <Pressable
-            onPress={onAttach}
-            disabled={disabled || busy}
-            hitSlop={8}
-            style={[styles.attach, (disabled || busy || !!mediaNote) && styles.attachOff]}
-            accessibilityRole="button"
-            accessibilityLabel="Attach photo or video"
-          >
-            <Text style={styles.attachText}>+</Text>
-          </Pressable>
-        ) : null}
-        <TextInput
-          value={text}
-          onChangeText={setText}
-          placeholder={editing ? 'New message text' : placeholder}
-          placeholderTextColor={colors.muted}
-          style={[styles.input, disabled && { opacity: 0.45 }]}
-          multiline
-          editable={!disabled && !busy}
-          keyboardType="default"
-          blurOnSubmit={false}
-          maxLength={16000}
-        />
-        <Pressable
-          onPress={submit}
-          disabled={!canSubmit}
-          style={[
-            styles.send,
-            !canSubmit && styles.sendOff,
-          ]}
-          accessibilityRole="button"
-        >
-          <Text style={styles.sendText}>{editing ? 'Save' : 'Send'}</Text>
-        </Pressable>
-      </View>
-      <View style={styles.counterRow}>
-        {showCounter && usage && (
-          <Text
-            style={[styles.counter, usage.warn && styles.counterWarn, over && styles.counterOver]}
-            numberOfLines={1}
-          >
-            {usage.text}
-          </Text>
+    <View style={[styles.wrap, { paddingBottom: 10 + insets.bottom }]}>
+      <View style={styles.column}>
+        {editing && (
+          <View style={styles.editBar}>
+            <Icon name="pencil" size={16} color={colors.cyan} />
+            <View style={styles.editCopy}>
+              <Text style={styles.editTitle}>Editing message</Text>
+              <Text style={styles.editLabel} numberOfLines={1}>
+                {editing.label}
+              </Text>
+            </View>
+            <Pressable
+              hitSlop={8}
+              onPress={onCancelEdit}
+              style={styles.iconSmall}
+              accessibilityRole="button"
+              accessibilityLabel="Cancel edit"
+            >
+              <Icon name="x" size={16} color={colors.muted} />
+            </Pressable>
+          </View>
         )}
-        {busy && <Text style={styles.busy}>{busyLabel || '…'}</Text>}
-        {!busy && over && (
-          <Text style={styles.counterOver} numberOfLines={1}>
-            keep it under 18 KB
-          </Text>
+        {mediaNote ? <Text style={styles.mediaNote}>{mediaNote}</Text> : null}
+        {hasMedia && attachment ? (
+          <View style={styles.draft}>
+            {attachment.preview ? (
+              <Image source={{ uri: attachment.preview }} style={styles.thumb} />
+            ) : (
+              <View style={styles.thumb} />
+            )}
+            <Text style={styles.draftLabel}>{attachment.kind === 'video' ? 'Video' : 'Photo'}</Text>
+            <Pressable
+              hitSlop={8}
+              onPress={onClearAttachment}
+              style={styles.iconSmall}
+              accessibilityRole="button"
+              accessibilityLabel="Remove attachment"
+            >
+              <Icon name="x" size={16} color={colors.muted} />
+            </Pressable>
+          </View>
+        ) : null}
+        <View style={styles.row}>
+          {!editing && onAttach ? (
+            <Pressable
+              onPress={onAttach}
+              disabled={disabled || busy}
+              hitSlop={6}
+              style={({ pressed }) => [styles.round, styles.attach, pressed && styles.attachPressed, attachOff && styles.off]}
+              accessibilityRole="button"
+              accessibilityLabel="Attach photo or video"
+            >
+              <Icon name="plus" size={22} color={colors.cyan} />
+            </Pressable>
+          ) : null}
+          <TextInput
+            value={text}
+            onChangeText={setText}
+            onFocus={() => setFocused(true)}
+            onBlur={() => setFocused(false)}
+            placeholder={editing ? 'New message text' : placeholder}
+            placeholderTextColor={colors.muted}
+            style={[
+              styles.input,
+              noWebOutline,
+              Platform.OS === 'web' && { height: webHeight },
+              focused && styles.inputFocus,
+              disabled && styles.inputOff,
+            ]}
+            onContentSizeChange={(e) => {
+              if (Platform.OS !== 'web') return;
+              const h = Math.ceil(e.nativeEvent.contentSize.height) + 2;
+              setWebHeight(Math.max(INPUT_MIN, Math.min(INPUT_MAX, h)));
+            }}
+            numberOfLines={1}
+            multiline
+            editable={!disabled && !busy}
+            keyboardType="default"
+            blurOnSubmit={false}
+            maxLength={16000}
+          />
+          <Pressable
+            onPress={submit}
+            disabled={!canSubmit}
+            style={({ pressed }) => [
+              styles.round,
+              canSubmit ? styles.sendOn : styles.sendIdle,
+              pressed && canSubmit && styles.sendPressed,
+            ]}
+            accessibilityRole="button"
+            accessibilityLabel={editing ? 'Save edit' : 'Send'}
+          >
+            <Icon
+              name={editing ? 'check' : 'send'}
+              size={20}
+              strokeWidth={2.4}
+              color={canSubmit ? colors.cyanText : colors.muted}
+            />
+          </Pressable>
+        </View>
+        {showStatus && (
+          <View style={styles.counterRow}>
+            {showCounter && usage ? (
+              <Text
+                style={[styles.counter, usage.warn && styles.counterWarn, over && styles.counterOver]}
+                numberOfLines={1}
+              >
+                {usage.text}
+              </Text>
+            ) : (
+              <View />
+            )}
+            {busy && <Text style={styles.busy}>{busyLabel || '…'}</Text>}
+            {!busy && over && (
+              <Text style={styles.counterOver} numberOfLines={1}>
+                keep it under 18 KB
+              </Text>
+            )}
+          </View>
         )}
       </View>
     </View>
@@ -168,53 +229,72 @@ export function Composer({
 
 const styles = StyleSheet.create({
   wrap: {
-    margin: 10,
-    padding: 10,
     backgroundColor: colors.card,
+    borderTopWidth: 1,
+    borderTopColor: colors.hairline,
+    paddingTop: 10,
+    paddingHorizontal: 10,
+  },
+  column: {
+    gap: 8,
   },
   editBar: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 10,
     backgroundColor: colors.cyanFaint,
-    borderRadius: radius.chip,
-    paddingHorizontal: 10,
+    borderLeftWidth: 3,
+    borderLeftColor: colors.cyan,
+    borderRadius: radius.sm,
+    paddingLeft: 10,
+    paddingRight: 4,
     paddingVertical: 6,
-    marginBottom: 8,
   },
-  editLabel: {
+  editCopy: {
     flex: 1,
+    minWidth: 0,
+  },
+  editTitle: {
     color: colors.cyan,
     fontSize: 12,
     fontWeight: '700',
   },
-  cancelText: {
-    color: colors.muted,
+  editLabel: {
+    color: colors.textSoft,
     fontSize: 12,
-    fontWeight: '600',
+    marginTop: 1,
+  },
+  iconSmall: {
+    width: 30,
+    height: 30,
+    borderRadius: radius.pill,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   mediaNote: {
     color: colors.muted,
-    fontSize: 11,
-    lineHeight: 15,
-    marginBottom: 8,
+    fontSize: 12,
+    lineHeight: 16,
+    paddingHorizontal: 4,
   },
   draft: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 8,
-    marginBottom: 8,
+    gap: 10,
+    backgroundColor: colors.sunken,
+    borderRadius: radius.md,
+    padding: 6,
   },
   thumb: {
-    width: 36,
-    height: 36,
-    borderRadius: 8,
+    width: 40,
+    height: 40,
+    borderRadius: radius.sm,
     backgroundColor: colors.cardRaised,
   },
   draftLabel: {
     flex: 1,
     color: colors.text,
-    fontSize: 12,
+    fontSize: 13,
     fontWeight: '600',
   },
   row: {
@@ -222,55 +302,59 @@ const styles = StyleSheet.create({
     alignItems: 'flex-end',
     gap: 8,
   },
-  attach: {
-    width: 44,
-    height: 44,
-    borderRadius: radius.chip,
+  round: {
+    width: 42,
+    height: 42,
+    borderRadius: 21,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: colors.glass,
+  },
+  attach: {
+    backgroundColor: colors.cardRaised,
     borderWidth: 1,
-    borderColor: colors.cyanSoft,
+    borderColor: colors.stroke,
   },
-  attachOff: {
+  attachPressed: {
+    backgroundColor: colors.cyanFaint,
+  },
+  off: {
     opacity: 0.4,
-  },
-  attachText: {
-    color: colors.cyan,
-    fontSize: 22,
-    lineHeight: 24,
-    fontWeight: '600',
   },
   input: {
     flex: 1,
+    minHeight: INPUT_MIN,
+    maxHeight: INPUT_MAX,
     color: colors.text,
     fontSize: 15,
-    lineHeight: 21,
-    maxHeight: 120,
-    paddingVertical: 6,
-    paddingHorizontal: 4,
-  },
-  send: {
-    backgroundColor: colors.cyan,
-    borderRadius: radius.chip,
+    lineHeight: 20,
+    backgroundColor: colors.sunken,
+    borderWidth: 1,
+    borderColor: colors.stroke,
+    borderRadius: 21,
     paddingHorizontal: 16,
-    paddingVertical: 10,
+    paddingTop: 10,
+    paddingBottom: 10,
   },
-  sendOff: {
-    opacity: 0.35,
+  inputFocus: {
+    borderColor: colors.cyanSoft,
   },
-  sendText: {
-    color: colors.cyanText,
-    fontSize: 14,
-    fontWeight: '700',
+  inputOff: {
+    opacity: 0.6,
+  },
+  sendOn: {
+    backgroundColor: colors.cyan,
+  },
+  sendPressed: {
+    backgroundColor: colors.cyanPressed,
+  },
+  sendIdle: {
+    backgroundColor: colors.cardRaised,
   },
   counterRow: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    minHeight: 16,
-    paddingHorizontal: 4,
-    marginTop: 4,
+    paddingHorizontal: 6,
   },
   counter: {
     color: colors.muted,
@@ -281,6 +365,7 @@ const styles = StyleSheet.create({
   },
   counterOver: {
     color: colors.danger,
+    fontSize: 11,
     fontWeight: '600',
   },
   busy: {

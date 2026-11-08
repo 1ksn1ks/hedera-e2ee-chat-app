@@ -1,39 +1,169 @@
-// Entry screen: topic id → connect (history metadata fetch) → unlock
-// (keystore auto, password for admin-pinned keys, or key import) + wallet
-// pairing for sending. No map, no feed — a messenger front door.
-import React, { useState } from 'react';
+// Entry screen: topic id, domain, or payer id → connect (history metadata
+// fetch) → unlock (keystore auto, password for admin-pinned keys, or key
+// import) + wallet pairing for sending. With a wallet connected, the
+// accounts it follows are listed under the input like the Globe map's
+// E2EE field (followsuggest.js). No map, no feed — a messenger front door.
+import React, { useMemo, useState, type ReactNode } from 'react';
 import {
+  Image,
   Pressable,
   ScrollView,
   StyleSheet,
   Text,
   TextInput,
   View,
+  type TextInputProps,
 } from 'react-native';
-import { baseStyles, colors, glassCard, radius } from '../theme';
+import { baseStyles, colors, glassCard, MAX_FORM, noWebOutline, radius } from '../theme';
 import type { E2eeChat } from '../hooks/useE2eeChat';
 import { RelayStatus } from '../components/RelayStatus';
+import { Icon, type IconName } from '../components/Icon';
+import {
+  avatarFor,
+  displayName,
+  followingEmptyText,
+  followItems,
+  peopleItems,
+  type FollowItem,
+} from '../services/identity';
 
 interface Props {
   chat: E2eeChat;
+}
+
+// followsuggest.js QUICK: the first rows, then "See all".
+const QUICK = 5;
+
+// A text field whose border turns cyan while it has focus.
+function Field({ style, onFocus, onBlur, ...rest }: TextInputProps) {
+  const [focused, setFocused] = useState(false);
+  return (
+    <TextInput
+      placeholderTextColor={colors.muted}
+      {...rest}
+      onFocus={(e) => {
+        setFocused(true);
+        onFocus?.(e);
+      }}
+      onBlur={(e) => {
+        setFocused(false);
+        onBlur?.(e);
+      }}
+      style={[baseStyles.input, noWebOutline, focused && baseStyles.inputFocus, style]}
+    />
+  );
+}
+
+function Card({ icon, title, children }: { icon: IconName; title: string; children: ReactNode }) {
+  return (
+    <View style={[glassCard, styles.card]}>
+      <View style={styles.cardHead}>
+        <View style={styles.cardIcon}>
+          <Icon name={icon} size={16} color={colors.cyan} />
+        </View>
+        <Text style={styles.cardTitle}>{title}</Text>
+      </View>
+      {children}
+    </View>
+  );
+}
+
+function PrimaryButton({
+  label,
+  onPress,
+  disabled,
+  ghost,
+  icon,
+}: {
+  label: string;
+  onPress: () => void;
+  disabled?: boolean;
+  ghost?: boolean;
+  icon?: IconName;
+}) {
+  return (
+    <Pressable
+      onPress={onPress}
+      disabled={disabled}
+      accessibilityRole="button"
+      style={({ pressed }) => [
+        ghost ? baseStyles.ghostButton : baseStyles.cyanButton,
+        pressed && !ghost && { backgroundColor: colors.cyanPressed },
+        pressed && ghost && { backgroundColor: colors.card },
+        disabled && baseStyles.buttonOff,
+      ]}
+    >
+      {icon ? <Icon name={icon} size={18} color={ghost ? colors.text : colors.cyanText} /> : null}
+      <Text style={ghost ? baseStyles.ghostButtonText : baseStyles.cyanButtonText}>{label}</Text>
+    </Pressable>
+  );
+}
+
+function FollowRow({ item, onPick, last }: { item: FollowItem; onPick: (item: FollowItem) => void; last: boolean }) {
+  return (
+    <Pressable
+      onPress={() => onPick(item)}
+      style={({ pressed }) => [styles.followRow, !last && styles.followRule, pressed && styles.followPressed]}
+      accessibilityRole="button"
+      accessibilityLabel={`Open ${item.username || item.id}`}
+    >
+      <Image source={{ uri: item.avatar }} style={[styles.followAvatar, item.dim && styles.followDim]} />
+      <View style={[styles.followText, item.dim && styles.followDim]}>
+        <Text style={styles.followName} numberOfLines={1}>
+          {item.username || item.id}
+        </Text>
+        <Text style={styles.followId} numberOfLines={1}>
+          {item.id}
+          {item.dim ? ' · no chat topic' : ''}
+        </Text>
+      </View>
+      <Icon name="chevron" size={16} color={colors.muted} />
+    </Pressable>
+  );
 }
 
 export function ConnectScreen({ chat }: Props) {
   const [topic, setTopic] = useState('');
   const [password, setPassword] = useState('');
   const [keyHex, setKeyHex] = useState('');
-  const [busy, setBusy] = useState<'' | 'connect' | 'password' | 'key' | 'wallet'>('');
+  const [newPw, setNewPw] = useState('');
+  const [newPw2, setNewPw2] = useState('');
+  const [busy, setBusy] = useState<'' | 'connect' | 'password' | 'key' | 'wallet' | 'setpw'>('');
   const [error, setError] = useState('');
+  const [showAll, setShowAll] = useState(false);
+  const [myNote, setMyNote] = useState('');
 
   const status = chat.unlock.status;
 
-  const doConnect = async () => {
+  // The field opens a topic id or a domain; a tapped person opens the topic
+  // connected to their profile.
+  const doConnect = async (value: string = topic, person = false) => {
     setBusy('connect');
     setError('');
-    const res = await chat.connect(topic);
+    const res = await chat.connect(value, { person });
     if (!res.ok) setError(res.error || 'Connect failed');
     setBusy('');
   };
+
+  const pickFollow = (item: FollowItem) => {
+    setShowAll(false);
+    void doConnect(item.id, true);
+  };
+
+  const followRows = useMemo(
+    () => followItems(chat.following, chat.profiles, topic.trim()),
+    [chat.following, chat.profiles, topic]
+  );
+  const followShown = showAll ? followRows : followRows.slice(0, QUICK);
+  // Search by user: anyone with a profile, minus who is already under Following.
+  const people = useMemo(
+    () => peopleItems(chat.profiles, topic, new Set(chat.following.map((f) => f.id))),
+    [chat.profiles, chat.following, topic]
+  );
+  const peopleShown = people.slice(0, QUICK);
+  const followEmpty = followingEmptyText(chat.followingStatus, chat.following.length, followRows.length);
+  const me = chat.account ? chat.profiles[chat.account] : undefined;
+  const myName = displayName(me);
 
   const doPassword = async () => {
     setBusy('password');
@@ -51,15 +181,45 @@ export function ConnectScreen({ chat }: Props) {
     setBusy('');
   };
 
+  const canSetPw =
+    busy === '' && !!keyHex.trim() && newPw.length >= 5 && newPw === newPw2;
+
+  const doSetPassword = async () => {
+    if (!canSetPw) return;
+    setBusy('setpw');
+    setError('');
+    const res = await chat.setTopicPassword(keyHex, newPw);
+    setBusy('');
+    if (!res.ok) {
+      setError(res.error || 'The password was not saved');
+      return;
+    }
+    setNewPw('');
+    setNewPw2('');
+    setKeyHex('');
+  };
+
   const doWallet = async () => {
     setBusy('wallet');
     setError('');
+    setMyNote('');
     const res = await chat.walletConnect();
     if (!res.ok) setError(res.error || 'Wallet connect failed');
     setBusy('');
   };
 
+  // The "Open my E2EE chat" button: the topic connected to your profile.
+  // No topic on your profile yet is a note, not an error.
+  const doMyChat = async () => {
+    setError('');
+    setMyNote('');
+    const res = await chat.openMyChat();
+    if (!res.ok) setMyNote(res.error || '');
+  };
+
   const connecting = status === 'connecting';
+  const needsUnlock = status === 'need-key' || status === 'need-password';
+  const shownError = error || (status === 'error' ? chat.unlock.message : '');
 
   return (
     <ScrollView
@@ -67,196 +227,522 @@ export function ConnectScreen({ chat }: Props) {
       contentContainerStyle={styles.content}
       keyboardShouldPersistTaps="handled"
     >
-      <Text style={styles.brand}>Hedera E2EE Chat</Text>
-      <Text style={baseStyles.subtitle}>
-        Encrypted topic chat. Messages are sealed to the topic key — only
-        holders of the topic private key can read them.
-      </Text>
-
-      <RelayStatus useRelay={chat.useRelay} transport={chat.transport} onToggle={chat.setUseRelay} />
-
-      <View style={[glassCard, styles.card]}>
-        <Text style={styles.cardTitle}>Topic</Text>
-        <TextInput
-          value={topic}
-          onChangeText={setTopic}
-          placeholder="0.0.12345"
-          placeholderTextColor={colors.muted}
-          autoCapitalize="none"
-          autoCorrect={false}
-          editable={!connecting}
-          style={styles.input}
-        />
-        <Pressable
-          onPress={doConnect}
-          disabled={connecting || !topic.trim()}
-          style={[baseStyles.cyanButton, (connecting || !topic.trim()) && styles.off]}
-        >
-          <Text style={baseStyles.cyanButtonText}>
-            {connecting ? 'Connecting…' : 'Connect topic'}
+      <View style={styles.column}>
+        <View style={styles.hero}>
+          <View style={styles.mark}>
+            <Icon name="lock" size={26} color={colors.cyan} />
+          </View>
+          <Text style={styles.brand}>Hedera E2EE Chat</Text>
+          <Text style={styles.tagline}>
+            Messages are sealed to the topic key. Only holders of the topic
+            private key can read them.
           </Text>
-        </Pressable>
-      </View>
+        </View>
 
-      {chat.meta && (
-        <View style={[glassCard, styles.card]}>
-          <Text style={styles.cardTitle}>Unlock</Text>
-          {status === 'need-password' && (
-            <>
-              <Text style={baseStyles.subtitle}>
-                This topic has a pinned key protected by a password. Enter it
-                to unwrap the topic key into your {`Keystore/Keychain`}.
-              </Text>
-              <TextInput
-                value={password}
-                onChangeText={setPassword}
-                placeholder="Password"
-                placeholderTextColor={colors.muted}
-                secureTextEntry
-                editable={busy !== 'password'}
-                style={[styles.input, { marginTop: 8 }]}
-              />
-              <Pressable
-                onPress={doPassword}
-                disabled={busy === 'password' || !password}
-                style={[baseStyles.cyanButton, (busy === 'password' || !password) && styles.off]}
-              >
-                <Text style={baseStyles.cyanButtonText}>
-                  {busy === 'password' ? 'Unwrapping…' : 'Unlock with password'}
-                </Text>
-              </Pressable>
-            </>
-          )}
-          {status === 'need-key' && (
-            <Text style={baseStyles.subtitle}>
-              No pinned password on this topic — import the topic private key
-              (DER hex, the same one the wallet uses to seal messages).
-            </Text>
-          )}
-          {status === 'need-password' && (
-            <Text style={[baseStyles.subtitle, { marginTop: 10 }]}>
-              or import the key directly:
-            </Text>
-          )}
-          <TextInput
-            value={keyHex}
-            onChangeText={setKeyHex}
-            placeholder="Topic private key (DER hex)"
-            placeholderTextColor={colors.muted}
+        <RelayStatus useRelay={chat.useRelay} transport={chat.transport} onToggle={chat.setUseRelay} />
+
+        <Card icon="hash" title="Open a chat">
+          <Field
+            value={topic}
+            onChangeText={(text) => {
+              setTopic(text);
+              setShowAll(false);
+            }}
+            onSubmitEditing={() => {
+              if (!connecting && topic.trim()) void doConnect();
+            }}
+            placeholder="Topic ID or domain"
             autoCapitalize="none"
             autoCorrect={false}
-            editable={
-              busy !== 'key' && (status === 'need-key' || status === 'need-password')
-            }
-            style={[styles.input, styles.keyInput, { marginTop: 8 }]}
-            multiline
-            numberOfLines={3}
+            editable={!connecting}
+            returnKeyType="go"
           />
-          <Pressable
-            onPress={doKey}
-            disabled={busy === 'key' || !keyHex.trim()}
-            style={[baseStyles.cyanButton, (busy === 'key' || !keyHex.trim()) && styles.off]}
-          >
-            <Text style={baseStyles.cyanButtonText}>
-              {busy === 'key' ? 'Unlocking…' : 'Import key'}
-            </Text>
-          </Pressable>
-          {status === 'unlocked' && (
-            <View style={[styles.chip, { alignSelf: 'flex-start', marginTop: 10 }]}>
-              <Text style={baseStyles.chipText}>Unlocked — opening chat…</Text>
+          {!chat.meta && (
+            <View accessibilityLabel="Following">
+              <View style={styles.followHead}>
+                <Icon name="users" size={14} color={colors.muted} />
+                <Text style={baseStyles.label}>
+                  Following{chat.followingStatus === 'ready' ? ` · ${chat.following.length}` : ''}
+                </Text>
+              </View>
+              {followShown.length > 0 && (
+                <View style={styles.followList}>
+                  {followShown.map((item, i) => (
+                    <FollowRow
+                      key={item.id}
+                      item={item}
+                      onPick={pickFollow}
+                      last={i === followShown.length - 1}
+                    />
+                  ))}
+                </View>
+              )}
+              {followRows.length > QUICK && (
+                <Pressable onPress={() => setShowAll((v) => !v)} accessibilityRole="button" hitSlop={6}>
+                  <Text style={styles.followMore}>
+                    {showAll ? 'Show less' : `See all (${followRows.length})`}
+                  </Text>
+                </Pressable>
+              )}
+              {followEmpty ? (
+                <Pressable
+                  disabled={chat.followingStatus !== 'offline'}
+                  onPress={() => {
+                    void chat.refreshFollowing(true);
+                  }}
+                >
+                  <Text style={styles.followEmpty}>{followEmpty}</Text>
+                </Pressable>
+              ) : null}
+              {peopleShown.length > 0 && (
+                <View accessibilityLabel="People">
+                  <View style={[styles.followHead, styles.peopleHead]}>
+                    <Icon name="users" size={14} color={colors.muted} />
+                    <Text style={baseStyles.label}>People</Text>
+                  </View>
+                  <View style={styles.followList}>
+                    {peopleShown.map((item, i) => (
+                      <FollowRow
+                        key={item.id}
+                        item={item}
+                        onPick={pickFollow}
+                        last={i === peopleShown.length - 1}
+                      />
+                    ))}
+                  </View>
+                  {people.length > QUICK && (
+                    <Text style={styles.followEmpty}>
+                      {`${people.length - QUICK} more. Keep typing to narrow it down.`}
+                    </Text>
+                  )}
+                </View>
+              )}
             </View>
           )}
-        </View>
-      )}
+          <PrimaryButton
+            label={connecting ? 'Connecting…' : 'Connect'}
+            onPress={() => {
+              void doConnect();
+            }}
+            disabled={connecting || !topic.trim()}
+          />
+        </Card>
 
-      {chat.meta && (
-        <View style={[glassCard, styles.card]}>
-          <Text style={styles.cardTitle}>Wallet</Text>
-          <Text style={baseStyles.subtitle}>
-            Sending pays the HBAR network fee through your own wallet — the
-            app never holds your signing key.
-          </Text>
-          {chat.account ? (
-            <View style={[styles.chip, { alignSelf: 'flex-start', marginTop: 10 }]}>
-              <Text style={baseStyles.chipText}>{chat.account}</Text>
-            </View>
-          ) : (
-            <Pressable
-              onPress={doWallet}
-              disabled={busy === 'wallet'}
-              style={[baseStyles.ghostButton, { marginTop: 10 }, busy === 'wallet' && styles.off]}
-            >
-              <Text style={baseStyles.ghostButtonText}>
-                {busy === 'wallet' ? 'Waiting for wallet…' : 'Connect wallet '}
+        {chat.meta && (
+          <Card icon="key" title="Unlock">
+            <View style={styles.topicLine}>
+              <Icon name="hash" size={14} color={colors.muted} />
+              <Text style={styles.topicText} numberOfLines={1}>
+                {chat.meta.topicId}
+                {chat.meta.via ? (
+                  <Text style={styles.topicVia}>
+                    {chat.meta.via === chat.account
+                      ? '  your chat'
+                      : `  via ${displayName(chat.profiles[chat.meta.via]) || chat.meta.via}`}
+                  </Text>
+                ) : null}
               </Text>
-            </Pressable>
-          )}
-          {chat.pairingUri && (
-            <Text style={[styles.pairing, { marginTop: 10 }]} selectable>
-              {chat.pairingUri}
-            </Text>
-          )}
-        </View>
-      )}
+            </View>
+            {status === 'need-password' && (
+              <>
+                <Text style={baseStyles.subtitle}>
+                  This topic has a pinned key protected by a password. Enter it
+                  to unwrap the topic key into your Keystore/Keychain.
+                </Text>
+                <Field
+                  value={password}
+                  onChangeText={setPassword}
+                  onSubmitEditing={() => {
+                    if (busy !== 'password' && password) void doPassword();
+                  }}
+                  placeholder="Password"
+                  secureTextEntry
+                  editable={busy !== 'password'}
+                />
+                <PrimaryButton
+                  label={busy === 'password' ? 'Unwrapping…' : 'Unlock with password'}
+                  onPress={doPassword}
+                  disabled={busy === 'password' || !password}
+                />
+                <View style={styles.or}>
+                  <View style={styles.orRule} />
+                  <Text style={styles.orText}>or import the key</Text>
+                  <View style={styles.orRule} />
+                </View>
+              </>
+            )}
+            {status === 'need-key' && (
+              <Text style={baseStyles.subtitle}>
+                This topic has no password yet. Paste the topic private key
+                (DER hex) to open it, or save a password for it below so the
+                password opens it from now on.
+              </Text>
+            )}
+            {needsUnlock && (
+              <>
+                <Field
+                  value={keyHex}
+                  onChangeText={setKeyHex}
+                  placeholder="Topic private key (DER hex)"
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                  editable={busy !== 'key'}
+                  style={styles.keyInput}
+                  multiline
+                  numberOfLines={3}
+                />
+                <PrimaryButton
+                  label={busy === 'key' ? 'Unlocking…' : 'Import key'}
+                  onPress={doKey}
+                  disabled={busy === 'key' || busy === 'setpw' || !keyHex.trim()}
+                  ghost={status === 'need-password'}
+                />
+              </>
+            )}
+            {status === 'need-key' && (
+              <>
+                <View style={styles.or}>
+                  <View style={styles.orRule} />
+                  <Text style={styles.orText}>or save a password for it</Text>
+                  <View style={styles.orRule} />
+                </View>
+                <Text style={baseStyles.subtitle}>
+                  The key above is encrypted with your password and pinned on
+                  this topic, the same as Set password in the Globe map. Your
+                  wallet pays the HBAR fee. The password never leaves this
+                  device.
+                </Text>
+                <Field
+                  value={newPw}
+                  onChangeText={setNewPw}
+                  placeholder="New password (5+ characters)"
+                  secureTextEntry
+                  editable={busy !== 'setpw'}
+                />
+                <Field
+                  value={newPw2}
+                  onChangeText={setNewPw2}
+                  onSubmitEditing={() => {
+                    if (canSetPw) void doSetPassword();
+                  }}
+                  placeholder="Repeat password"
+                  secureTextEntry
+                  editable={busy !== 'setpw'}
+                />
+                {newPw2 && newPw !== newPw2 ? (
+                  <Text style={styles.myNote}>The passwords don't match.</Text>
+                ) : null}
+                <PrimaryButton
+                  label={busy === 'setpw' ? 'Confirm in your wallet…' : 'Save password and unlock'}
+                  onPress={doSetPassword}
+                  disabled={!canSetPw}
+                  ghost
+                  icon="key"
+                />
+              </>
+            )}
+            {status === 'unlocked' && (
+              <View style={[baseStyles.chip, styles.chipRow]}>
+                <Icon name="check" size={14} color={colors.cyan} />
+                <Text style={baseStyles.chipText}>Unlocked, opening chat…</Text>
+              </View>
+            )}
+          </Card>
+        )}
 
-      {status === 'error' && chat.unlock.message ? (
-        <Text style={[baseStyles.error, { textAlign: 'center' }]}>{chat.unlock.message}</Text>
-      ) : null}
-      {error ? <Text style={[baseStyles.error, { textAlign: 'center' }]}>{error}</Text> : null}
+        <Card icon="wallet" title="Wallet">
+          {chat.account ? (
+            <View style={styles.me}>
+              <Image source={{ uri: avatarFor(me) }} style={styles.meAvatar} />
+              <View style={styles.followText}>
+                <Text style={styles.followName} numberOfLines={1}>
+                  {myName || chat.account}
+                </Text>
+                {myName ? (
+                  <Text style={styles.followId} numberOfLines={1}>
+                    {chat.account}
+                  </Text>
+                ) : null}
+              </View>
+              <View style={[baseStyles.chip, styles.chipRow]}>
+                <Icon name="check" size={12} color={colors.cyan} />
+                <Text style={baseStyles.chipText}>Connected</Text>
+              </View>
+            </View>
+          ) : null}
+          {chat.account && !chat.meta ? (
+            <Pressable
+              onPress={() => {
+                void doMyChat();
+              }}
+              disabled={connecting}
+              accessibilityRole="button"
+              accessibilityLabel="Open my E2EE chat"
+              style={({ pressed }) => [styles.myChat, pressed && styles.followPressed, connecting && baseStyles.buttonOff]}
+            >
+              <View style={styles.cardIcon}>
+                <Icon name="lock" size={16} color={colors.cyan} />
+              </View>
+              <View style={styles.followText}>
+                <Text style={styles.followName}>Open my E2EE chat</Text>
+                <Text style={styles.followId} numberOfLines={1}>
+                  {me && me.topic ? me.topic : 'The topic connected to your profile'}
+                </Text>
+              </View>
+              <Icon name="chevron" size={16} color={colors.muted} />
+            </Pressable>
+          ) : null}
+          {chat.account && myNote ? <Text style={styles.myNote}>{myNote}</Text> : null}
+          {chat.account ? null : (
+            <>
+              <Text style={baseStyles.subtitle}>
+                Sending pays the HBAR network fee through your own wallet. The
+                app never holds your signing key.
+              </Text>
+              <PrimaryButton
+                label={busy === 'wallet' ? 'Waiting for wallet…' : 'Connect wallet'}
+                onPress={doWallet}
+                disabled={busy === 'wallet'}
+                ghost
+                icon="wallet"
+              />
+            </>
+          )}
+          {chat.pairingUri && !chat.account && (
+            <View style={styles.pairingBox}>
+              <Text style={baseStyles.label}>Pairing link</Text>
+              <Text style={styles.pairing} selectable>
+                {chat.pairingUri}
+              </Text>
+            </View>
+          )}
+        </Card>
+
+        {shownError ? (
+          <View style={baseStyles.errorBox}>
+            <Text style={baseStyles.error}>{shownError}</Text>
+          </View>
+        ) : null}
+      </View>
     </ScrollView>
   );
 }
 
 const styles = StyleSheet.create({
   content: {
-    padding: 16,
+    flexGrow: 1,
+    paddingHorizontal: 16,
+    paddingTop: 28,
+    paddingBottom: 40,
+  },
+  column: {
+    width: '100%',
+    maxWidth: MAX_FORM,
+    alignSelf: 'center',
     gap: 14,
-    alignItems: 'stretch',
+  },
+  hero: {
+    alignItems: 'center',
+    gap: 8,
+    paddingBottom: 6,
+  },
+  mark: {
+    width: 56,
+    height: 56,
+    borderRadius: radius.xl,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: colors.cyanFaint,
+    borderWidth: 1,
+    borderColor: colors.cyanSoft,
+    marginBottom: 4,
   },
   brand: {
-    color: colors.cyan,
-    fontSize: 22,
+    color: colors.text,
+    fontSize: 24,
     fontWeight: '800',
+    letterSpacing: -0.3,
     textAlign: 'center',
-    marginTop: 24,
+  },
+  tagline: {
+    color: colors.muted,
+    fontSize: 14,
+    lineHeight: 20,
+    textAlign: 'center',
+    maxWidth: 360,
   },
   card: {
-    padding: 14,
+    padding: 16,
+    gap: 12,
+  },
+  cardHead: {
+    flexDirection: 'row',
+    alignItems: 'center',
     gap: 10,
+  },
+  cardIcon: {
+    width: 28,
+    height: 28,
+    borderRadius: radius.sm,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: colors.cyanFaint,
   },
   cardTitle: {
     color: colors.text,
-    fontSize: 15,
+    fontSize: 16,
     fontWeight: '700',
   },
-  input: {
-    backgroundColor: colors.bg,
+  keyInput: {
+    minHeight: 84,
+    textAlignVertical: 'top',
+    fontSize: 13,
+  },
+  followHead: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    marginTop: 2,
+    marginBottom: 6,
+  },
+  peopleHead: {
+    marginTop: 12,
+  },
+  followList: {
+    backgroundColor: colors.sunken,
+    borderRadius: radius.md,
     borderWidth: 1,
     borderColor: colors.hairline,
-    borderRadius: radius.chip,
+    overflow: 'hidden',
+  },
+  followRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+  },
+  followRule: {
+    borderBottomWidth: 1,
+    borderBottomColor: colors.hairline,
+  },
+  followPressed: {
+    backgroundColor: colors.cyanFaint,
+  },
+  followDim: {
+    opacity: 0.45,
+  },
+  followAvatar: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: colors.cardRaised,
+  },
+  followText: {
+    flex: 1,
+    minWidth: 0,
+  },
+  followName: {
     color: colors.text,
     fontSize: 15,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
+    fontWeight: '600',
   },
-  keyInput: {
-    minHeight: 70,
-    textAlignVertical: 'top',
+  followId: {
+    color: colors.muted,
+    fontSize: 12,
+    marginTop: 2,
   },
-  off: {
-    opacity: 0.35,
+  followMore: {
+    color: colors.cyan,
+    fontSize: 13,
+    fontWeight: '600',
+    paddingTop: 10,
+    paddingHorizontal: 2,
   },
-  chip: {
-    backgroundColor: colors.cyanFaint,
-    borderColor: colors.cyanSoft,
-    borderWidth: 1,
-    borderRadius: 999,
+  followEmpty: {
+    color: colors.muted,
+    fontSize: 13,
+    paddingVertical: 4,
+    paddingHorizontal: 2,
+  },
+  topicLine: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    alignSelf: 'flex-start',
+    backgroundColor: colors.sunken,
+    borderRadius: radius.sm,
     paddingHorizontal: 10,
-    paddingVertical: 5,
+    paddingVertical: 6,
+    maxWidth: '100%',
+  },
+  topicText: {
+    color: colors.text,
+    fontSize: 13,
+    fontWeight: '600',
+    flexShrink: 1,
+  },
+  topicVia: {
+    color: colors.muted,
+    fontWeight: '400',
+  },
+  or: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    marginVertical: 2,
+  },
+  orRule: {
+    flex: 1,
+    height: 1,
+    backgroundColor: colors.hairline,
+  },
+  orText: {
+    color: colors.muted,
+    fontSize: 12,
+  },
+  chipRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    alignSelf: 'flex-start',
+  },
+  me: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
+  meAvatar: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: colors.cardRaised,
+  },
+  myChat: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    backgroundColor: colors.sunken,
+    borderRadius: radius.md,
+    borderWidth: 1,
+    borderColor: colors.hairline,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+  },
+  myNote: {
+    color: colors.muted,
+    fontSize: 13,
+    lineHeight: 18,
+  },
+  pairingBox: {
+    gap: 6,
+    backgroundColor: colors.sunken,
+    borderRadius: radius.md,
+    padding: 12,
   },
   pairing: {
-    color: colors.muted,
-    fontSize: 10,
-    lineHeight: 14,
+    color: colors.textSoft,
+    fontSize: 11,
+    lineHeight: 16,
   },
 });

@@ -20,7 +20,6 @@ import {
   StreamEvent,
 } from '../services/backend';
 import { fetchMirrorHistory, startMirrorTail } from '../services/mirror';
-import { loadUseRelay, saveUseRelay } from '../services/relayPref';
 import {
   chooseTransport,
   shouldContactBackend,
@@ -40,6 +39,7 @@ import { packFitting, unpackChatPayload, type SealedMedia } from '../services/se
 import {
   decryptMessage,
   decryptWithPassword,
+  encryptWithPassword,
   encryptMessage,
   parsePrivateKey,
   parsePublicKey,
@@ -47,6 +47,8 @@ import {
 import { releaseHeldMedia } from '../services/mediaCrypto';
 import { loadTopicKey, storeTopicKey } from '../services/secretStore';
 import { connectWallet, disconnectWallet, getConnectedAccount, sendTopicMessage } from '../services/wallet';
+import { isTopicId, RESOLVE_EMPTY } from '../services/identity';
+import { useIdentity } from './useIdentity';
 
 export interface Bubble {
   sig: string;
@@ -91,6 +93,8 @@ export interface TopicMeta {
   hasPinnedKey: boolean;
   pinned: PinnedKeyBundle | null;
   publicKeyHex: string | null;
+  // The domain or payer id the topic was opened by, if not the id itself.
+  via: string | null;
 }
 
 // dd/mm/yy HH:MM — the app's single timestamp presentation.
@@ -127,9 +131,9 @@ export function useE2eeChat() {
   const [account, setAccount] = useState<string | null>(null);
   const [walletBusy, setWalletBusy] = useState(false);
   const [pairingUri, setPairingUri] = useState<string | null>(null);
-  // TRANSPORT: "Use relay server" persists as useRelay. `transport` is the
-  // path actually in use (Relay vs Direct Hedera), which can fall back while
-  // the switch stays on.
+  // TRANSPORT: "Use relay server" is on at every launch; turning it off
+  // lasts for this session only. `transport` is the path actually in use
+  // (Relay vs Direct Hedera), which can fall back while the switch stays on.
   const [useRelay, setUseRelayState] = useState(true);
   const [transport, setTransport] = useState<ActiveTransport>('relay');
 
@@ -153,28 +157,9 @@ export function useE2eeChat() {
   const appStateRef = useRef<AppStateStatus>(AppState.currentState || 'active');
   const mirrorCloseRef = useRef<(() => void) | null>(null);
   const probeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const prefTouchedRef = useRef(false);
-  const prefReadyRef = useRef<Promise<void> | null>(null);
   const goMirrorRef = useRef<(topic: string) => void>(() => {});
-  if (!prefReadyRef.current) {
-    // Start before paint so Connect awaits the saved switch. A later toggle
-    // sets prefTouchedRef and this result is ignored.
-    prefReadyRef.current = loadUseRelay()
-      .then((on) => {
-        if (prefTouchedRef.current) return;
-        setUseRelayState(on);
-        modeRef.current = on ? 'relay' : 'hedera-only';
-        if (!topicIdRef.current) {
-          const idle = on ? 'relay' : 'mirror';
-          activeRef.current = idle;
-          setTransport(idle);
-        }
-      })
-      .then(
-        () => undefined,
-        () => undefined
-      );
-  }
+
+  const identity = useIdentity(() => modeRef.current, account);
 
   const setAccountBoth = (acc: string | null) => {
     accountRef.current = acc;
@@ -566,6 +551,7 @@ export function useE2eeChat() {
         hasPinnedKey: !!pinned,
         pinned,
         publicKeyHex,
+        via: null,
       };
 
       // Render whatever this key can already read (empty while locked).
@@ -615,11 +601,11 @@ export function useE2eeChat() {
   );
 
   const connect = useCallback(
-    async (topicId: string): Promise<Result> => {
-      const topic = String(topicId || '').trim();
-      if (!/^\d+\.\d+\.\d+$/.test(topic)) {
-        return { ok: false, error: 'Topic must look like 0.0.123' };
-      }
+    async (input: string, opts: { person?: boolean } = {}): Promise<Result> => {
+      // The field: a topic id or a domain. A person tapped in a list
+      // (opts.person, input = their account id): their connected topic.
+      const raw = String(input || '').trim();
+      if (!raw) return { ok: false, error: RESOLVE_EMPTY };
       setPhase('idle');
       setBubbles([]);
       setPairingUri(null);
@@ -627,12 +613,24 @@ export function useE2eeChat() {
       editsRef.current = new Map();
       seqRef.current = 0;
       stopLive();
-      await prefReadyRef.current;
       setUnlock({ status: 'connecting', message: '' });
+      const resolved = opts.person ? await identity.resolvePerson(raw) : await identity.resolve(raw);
+      const fail = (error: string): Result => {
+        topicIdRef.current = null;
+        setMeta(null);
+        setUnlock({ status: 'none', message: '' });
+        return { ok: false, error };
+      };
+      if ('error' in resolved) return fail(resolved.error);
+      const topic = resolved.topicId;
+      if (!isTopicId(topic)) {
+        return fail('Enter a topic ID (0.0.123) or a domain.');
+      }
+      const via = resolved.via && resolved.via !== topic ? resolved.via : null;
       topicIdRef.current = topic;
       try {
         const { meta } = await loadHistory(topic);
-        setMeta(meta);
+        setMeta({ ...meta, via });
         // Keystore first: a key unwrapped in a previous session unlocks
         // without the password.
         const stored = await loadTopicKey(topic);
@@ -652,7 +650,7 @@ export function useE2eeChat() {
         return { ok: false, error: e?.message || String(e) };
       }
     },
-    [finishUnlock, loadHistory]
+    [finishUnlock, identity.resolve, identity.resolvePerson, loadHistory]
   );
 
   const unlockWithPassword = useCallback(
@@ -671,9 +669,82 @@ export function useE2eeChat() {
     [finishUnlock]
   );
 
+  // A pasted key must belong to this topic: its public half has to equal the
+  // pinned public key. A wrong key would otherwise "unlock" and show nothing,
+  // or get saved under a password. 'nopub' = nothing pinned to check against.
+  const checkTopicKey = (derHex: string): 'ok' | 'invalid' | 'mismatch' | 'nopub' => {
+    let secret: Uint8Array;
+    try {
+      if (!/^[0-9a-fA-F]{64,}$/.test(derHex)) return 'invalid';
+      secret = parsePrivateKey(derHex);
+    } catch {
+      return 'invalid';
+    }
+    const pub = publicKeyRef.current;
+    if (!pub || pub.length !== 32) return 'nopub';
+    const mine = secret.slice(32);
+    for (let i = 0; i < 32; i++) if (mine[i] !== pub[i]) return 'mismatch';
+    return 'ok';
+  };
+
+  const KEY_INVALID = 'That is not a valid topic key (expected DER hex)';
+  const KEY_MISMATCH = "That key doesn't belong to this topic (it doesn't match the topic's public key).";
+
   const unlockWithKey = useCallback(
     async (derHex: string): Promise<Result> => {
-      await finishUnlock(String(derHex || '').trim());
+      const key = String(derHex || '').trim();
+      const check = checkTopicKey(key);
+      if (check === 'invalid') return { ok: false, error: KEY_INVALID };
+      if (check === 'mismatch') return { ok: false, error: KEY_MISMATCH };
+      await finishUnlock(key);
+      return { ok: true };
+    },
+    [finishUnlock]
+  );
+
+  // The Globe map's "Set password" (encryptedtopicchat.js): the topic key,
+  // encrypted with a password (argon2id + secretbox), pinned on the topic as
+  // { type: 'set_encrypted_key', encryptedPrivateKey, nonce, salt }. From
+  // then on the password unlocks the topic here and in the Globe map. The
+  // wallet pays the HBAR fee. The password itself never leaves this device.
+  const setTopicPassword = useCallback(
+    async (derHex: string, password: string): Promise<Result> => {
+      const topic = topicIdRef.current;
+      if (!topic) return { ok: false, error: 'No topic connected' };
+      const key = String(derHex || '').trim();
+      const check = checkTopicKey(key);
+      if (check === 'invalid') return { ok: false, error: KEY_INVALID };
+      if (check === 'mismatch') return { ok: false, error: KEY_MISMATCH };
+      if (check === 'nopub') {
+        return { ok: false, error: 'This topic has no public key pinned, so the key cannot be checked. Pin one first.' };
+      }
+      if (String(password || '').length < 5) {
+        return { ok: false, error: 'Password must be at least 5 characters long' };
+      }
+      const acc = (await getConnectedAccount()) || accountRef.current;
+      if (!acc) return { ok: false, error: 'Connect a wallet to save the password on the topic (HBAR network fee only)' };
+      try {
+        const bundle = await encryptWithPassword(key, password);
+        const body = JSON.stringify({
+          type: 'set_encrypted_key',
+          encryptedPrivateKey: bundle.encrypted,
+          nonce: bundle.nonce,
+          salt: bundle.salt,
+        });
+        await sendTopicMessage(topic, body);
+        setAccountBoth(acc);
+        if (shouldReportSubmit(modeRef.current, activeRef.current)) {
+          void reportPendingSend(topic, body, acc).then((ok) => {
+            if (!ok) goMirrorRef.current(topic);
+          });
+        }
+        const pinned: PinnedKeyBundle = { encrypted: bundle.encrypted, nonce: bundle.nonce, salt: bundle.salt };
+        pinnedRef.current = pinned;
+        setMeta((m) => (m ? { ...m, hasPinnedKey: true, pinned } : m));
+      } catch (e: any) {
+        return { ok: false, error: e?.message || 'The password was not saved' };
+      }
+      await finishUnlock(key);
       return { ok: true };
     },
     [finishUnlock]
@@ -798,6 +869,16 @@ export function useE2eeChat() {
 
   // ── Wallet ─────────────────────────────────────────────────────────────
 
+  // Your own E2EE chat: the topic connected to your profile (Edit profile →
+  // Connect in the Globe map), opened like tapping yourself under People.
+  const openMyChat = useCallback(async (): Promise<Result> => {
+    const acc = accountRef.current || (await getConnectedAccount());
+    if (!acc) return { ok: false, error: 'Connect a wallet first' };
+    return connect(acc, { person: true });
+  }, [connect]);
+
+  // Logging in only connects the wallet. Your own chat opens from its
+  // button (openMyChat), never by itself.
   const walletConnect = useCallback(async () => {
     setWalletBusy(true);
     setPairingUri(null);
@@ -808,6 +889,9 @@ export function useE2eeChat() {
     } catch (e: any) {
       return { ok: false as const, error: e?.message || 'Wallet connect failed' };
     } finally {
+      // The pairing link carries the session's symKey and is single-use:
+      // once pairing ends (approved or not) it is never shown again.
+      setPairingUri(null);
       setWalletBusy(false);
     }
   }, []);
@@ -840,10 +924,8 @@ export function useE2eeChat() {
 
   const setUseRelay = useCallback(
     (on: boolean) => {
-      prefTouchedRef.current = true;
       setUseRelayState(on);
       modeRef.current = on ? 'relay' : 'hedera-only';
-      void saveUseRelay(on);
       const topic = topicIdRef.current;
       if (!topic || !privateKeyRef.current) {
         const idle = on ? 'relay' : 'mirror';
@@ -915,9 +997,11 @@ export function useE2eeChat() {
     walletBusy,
     pairingUri,
     connect,
+    openMyChat,
     leave,
     unlockWithPassword,
     unlockWithKey,
+    setTopicPassword,
     send,
     edit,
     walletConnect,
@@ -926,6 +1010,10 @@ export function useE2eeChat() {
     useRelay,
     transport,
     setUseRelay,
+    profiles: identity.profiles,
+    following: identity.following,
+    followingStatus: identity.followingStatus,
+    refreshFollowing: identity.refreshFollowing,
   };
 }
 

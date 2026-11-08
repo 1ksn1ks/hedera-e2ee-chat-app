@@ -16,16 +16,24 @@ import {
   type GestureResponderEvent,
   type ViewStyle,
 } from 'react-native';
-import { colors, glassCard, radius } from '../theme';
+import { colors, radius } from '../theme';
 import { Bubble } from '../hooks/useE2eeChat';
 import { decryptGate } from '../services/decryptSlots';
 import { isVideoUrl, onMediaReleased, openSealedPart, releasePreview } from '../services/mediaCrypto';
 import type { SealedPoster } from '../services/sealedMedia';
-
-const AVATAR = 'https://kiloscribe.com/api/inscription-cdn/0.0.4819119';
+import {
+  avatarFor,
+  DEFAULT_AVATAR,
+  displayName,
+  explorerUrl,
+  safeHttpUrl,
+  type Profile,
+} from '../services/identity';
 
 interface Props {
   bubble: Bubble;
+  /** The sender's profile card, if they have one. */
+  profile?: Profile;
   showAvatar: boolean;
   showHeader: boolean;
   stamp: string;
@@ -33,6 +41,60 @@ interface Props {
   onEdit: (bubble: Bubble) => void;
   /** Native list signal. Web uses IntersectionObserver and ignores this. */
   near: boolean;
+}
+
+// Profile picture, or the default one when there is none or it fails to load.
+function Avatar({ profile }: { profile?: Profile }) {
+  const uri = avatarFor(profile);
+  const [failed, setFailed] = useState('');
+  return (
+    <Image
+      source={{ uri: failed === uri ? DEFAULT_AVATAR : uri }}
+      style={styles.avatar}
+      onError={() => {
+        if (uri !== DEFAULT_AVATAR) setFailed(uri);
+      }}
+      accessibilityLabel="Profile photo"
+    />
+  );
+}
+
+// First message of a run: account id (opens the explorer) then the
+// username, which opens the sender's own link when it is http(s) —
+// the Globe map's chat header (encryptedtopicchat.js, payerlink.js).
+function RunHeader({ payer, profile, mine }: { payer: string; profile?: Profile; mine: boolean }) {
+  const name = displayName(profile);
+  const link = safeHttpUrl(profile && profile.click2url);
+  return (
+    <View style={[styles.runHeader, mine && styles.runHeaderMine]}>
+      <Text
+        style={styles.accid}
+        numberOfLines={1}
+        accessibilityRole="link"
+        onPress={() => {
+          void Linking.openURL(explorerUrl(payer));
+        }}
+      >
+        {payer}
+      </Text>
+      {name ? (
+        <Text
+          style={styles.username}
+          numberOfLines={1}
+          accessibilityRole={link ? 'link' : undefined}
+          onPress={
+            link
+              ? () => {
+                  void Linking.openURL(link);
+                }
+              : undefined
+          }
+        >
+          {name}
+        </Text>
+      ) : null}
+    </View>
+  );
 }
 
 type OpenPart = { url?: string; b64?: string; fileKey: string; header: string; mime?: string; size?: number };
@@ -311,7 +373,7 @@ function Playable({
     style: {
       width: 240,
       height: 160,
-      borderRadius: 8,
+      borderRadius: radius.md,
       marginTop: 6,
       backgroundColor: colors.bg,
       objectFit: 'cover',
@@ -319,7 +381,7 @@ function Playable({
   });
 }
 
-export function MessageBubble({ bubble, showAvatar, showHeader, stamp, canEdit, onEdit, near }: Props) {
+export function MessageBubble({ bubble, profile, showAvatar, showHeader, stamp, canEdit, onEdit, near }: Props) {
   const [expanded, setExpanded] = useState(false);
   const hostRef = useRef<View>(null);
   const onScreen = useBubbleNear(hostRef, near);
@@ -333,36 +395,19 @@ export function MessageBubble({ bubble, showAvatar, showHeader, stamp, canEdit, 
   return (
     <View
       ref={hostRef}
-      style={[
-        styles.row,
-        mine && styles.rowMine,
-        !showAvatar && { paddingTop: 2 },
-        showAvatar && { paddingTop: 10 },
-      ]}
+      style={[styles.row, mine && styles.rowMine, showAvatar ? styles.rowFirst : styles.rowNext]}
     >
-      <View style={styles.avatarCol}>
-        {showAvatar && (
-          <View style={styles.avatarWrap}>
-            <Image
-              source={{ uri: AVATAR }}
-              style={styles.avatar}
-              onError={() => {}}
-            />
-            {showHeader && (
-              <Text style={[styles.payerName, mine && styles.payerNameMine]} numberOfLines={1}>
-                {mine ? 'you' : bubble.payer}
-              </Text>
-            )}
-          </View>
-        )}
-      </View>
+      <View style={styles.avatarCol}>{showAvatar && <Avatar profile={profile} />}</View>
       <View style={[styles.bubbleCol, mine && styles.bubbleColMine]}>
+        {showHeader && <RunHeader payer={bubble.payer} profile={profile} mine={mine} />}
         <Pressable
           onLongPress={handleLongPress}
-          style={[
+          style={({ pressed }) => [
             styles.bubble,
-            glassCard,
             mine ? styles.bubbleMine : styles.bubbleTheirs,
+            showHeader && (mine ? styles.firstMine : styles.firstTheirs),
+            bubble.pending && styles.bubblePending,
+            pressed && canEdit && !bubble.pending && styles.bubblePressed,
             long && !expanded && styles.bubbleClamped,
           ]}
           accessibilityRole="button"
@@ -375,13 +420,13 @@ export function MessageBubble({ bubble, showAvatar, showHeader, stamp, canEdit, 
           ) : null}
           <MediaFrame bubble={bubble} near={onScreen} />
           {long && (
-            <Pressable onPress={() => setExpanded((v) => !v)}>
+            <Pressable onPress={() => setExpanded((v) => !v)} hitSlop={6}>
               <Text style={styles.more}>{expanded ? 'Show less' : 'Show more'}</Text>
             </Pressable>
           )}
           <View style={styles.metaRow}>
-            {bubble.edited && <Text style={styles.edited}>edited</Text>}
-            <Text style={[styles.stamp, mine && styles.stampMine]}>
+            {bubble.edited && <Text style={[styles.edited, mine && styles.metaMine]}>edited</Text>}
+            <Text style={[styles.stamp, mine && styles.metaMine]}>
               {bubble.pending ? 'sending…' : stamp}
             </Text>
           </View>
@@ -394,59 +439,82 @@ export function MessageBubble({ bubble, showAvatar, showHeader, stamp, canEdit, 
 const styles = StyleSheet.create({
   row: {
     flexDirection: 'row',
-    alignItems: 'flex-end',
-    paddingHorizontal: 12,
+    alignItems: 'flex-start',
+    paddingHorizontal: 10,
+  },
+  rowFirst: {
+    paddingTop: 14,
+  },
+  rowNext: {
+    paddingTop: 3,
   },
   rowMine: {
     flexDirection: 'row-reverse',
   },
   avatarCol: {
-    width: 64,
-    alignItems: 'center',
-    justifyContent: 'flex-end',
-    paddingBottom: 4,
-  },
-  avatarWrap: {
+    width: 44,
     alignItems: 'center',
   },
   avatar: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
+    width: 34,
+    height: 34,
+    borderRadius: 17,
     backgroundColor: colors.cardRaised,
-  },
-  payerName: {
-    color: colors.cyan,
-    fontSize: 11,
-    fontWeight: '600',
-    marginTop: 3,
-  },
-  payerNameMine: {
-    color: colors.muted,
   },
   bubbleCol: {
     flex: 1,
-    flexDirection: 'row',
+    alignItems: 'flex-start',
   },
   bubbleColMine: {
-    justifyContent: 'flex-end',
+    alignItems: 'flex-end',
+  },
+  runHeader: {
+    flexDirection: 'row',
+    alignItems: 'baseline',
+    gap: 6,
+    maxWidth: '80%',
+    marginBottom: 4,
+    paddingHorizontal: 4,
+  },
+  runHeaderMine: {
+    flexDirection: 'row-reverse',
+  },
+  accid: {
+    color: colors.muted,
+    fontSize: 11,
+    flexShrink: 0,
+  },
+  username: {
+    color: colors.cyan,
+    fontSize: 13,
+    fontWeight: '700',
+    flexShrink: 1,
   },
   bubble: {
-    maxWidth: '82%',
-    paddingVertical: 8,
+    maxWidth: '80%',
+    paddingTop: 8,
+    paddingBottom: 6,
     paddingHorizontal: 12,
-    marginBottom: 6,
+    borderRadius: radius.bubble,
   },
   bubbleTheirs: {
-    borderRadius: radius.bubble,
-    borderTopLeftRadius: 4,
-    backgroundColor: colors.card,
+    backgroundColor: colors.bubbleTheirs,
   },
   bubbleMine: {
-    borderRadius: radius.bubble,
-    borderTopRightRadius: 4,
-    backgroundColor: colors.cyanFaint,
-    borderColor: colors.cyanSoft,
+    backgroundColor: colors.bubbleMine,
+  },
+  // The first bubble of a run points at its avatar.
+  firstTheirs: {
+    borderTopLeftRadius: 6,
+  },
+  firstMine: {
+    borderTopRightRadius: 6,
+  },
+  bubblePending: {
+    opacity: 0.7,
+  },
+  bubblePressed: {
+    opacity: 0.85,
   },
   bubbleClamped: {
     overflow: 'hidden',
@@ -467,7 +535,7 @@ const styles = StyleSheet.create({
   image: {
     width: 240,
     height: 160,
-    borderRadius: 8,
+    borderRadius: radius.md,
     backgroundColor: colors.bg,
   },
   posterEmpty: {
@@ -511,7 +579,7 @@ const styles = StyleSheet.create({
   failBox: {
     width: 240,
     minHeight: 72,
-    borderRadius: 8,
+    borderRadius: radius.md,
     marginTop: 6,
     backgroundColor: colors.cardRaised,
     alignItems: 'center',
@@ -533,18 +601,18 @@ const styles = StyleSheet.create({
     justifyContent: 'flex-end',
     alignItems: 'center',
     gap: 5,
-    marginTop: 4,
+    marginTop: 3,
   },
   edited: {
     color: colors.muted,
-    fontSize: 10,
+    fontSize: 11,
     fontStyle: 'italic',
   },
   stamp: {
     color: colors.muted,
-    fontSize: 10,
+    fontSize: 11,
   },
-  stampMine: {
-    color: colors.muted,
+  metaMine: {
+    color: colors.mineMeta,
   },
 });

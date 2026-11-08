@@ -3,14 +3,17 @@
 // whole E2EE engine (crypto, ingest, live stream, edits, wallet) lives in
 // useE2eeChat and survives the screen switch.
 import React from 'react';
-import { StatusBar, View } from 'react-native';
+import { StatusBar, useWindowDimensions, View } from 'react-native';
 import { initialWindowMetrics, SafeAreaProvider } from 'react-native-safe-area-context';
 import { useE2eeChat } from './src/hooks/useE2eeChat';
 import { ConnectScreen } from './src/screens/ConnectScreen';
 import { ChatScreen } from './src/screens/ChatScreen';
+import { colors, MAX_COLUMN } from './src/theme';
 
 function Chat() {
   const chat = useE2eeChat();
+  // A wide browser window gets one centered column with side rules.
+  const wide = useWindowDimensions().width > MAX_COLUMN;
   const inChat =
     chat.phase === 'ready' &&
     chat.unlock.status === 'unlocked' &&
@@ -22,9 +25,14 @@ function Chat() {
   }
 
   return (
-    <View style={{ flex: 1, backgroundColor: '#0a0a0a' }}>
-      <StatusBar barStyle="light-content" backgroundColor="#0a0a0a" />
-      <View style={{ flex: 1 }}>
+    <View style={{ flex: 1, backgroundColor: colors.bg }}>
+      <StatusBar barStyle="light-content" backgroundColor={colors.card} />
+      <View
+        style={[
+          { flex: 1, width: '100%', maxWidth: MAX_COLUMN, alignSelf: 'center' },
+          wide && { borderLeftWidth: 1, borderRightWidth: 1, borderColor: colors.hairline },
+        ]}
+      >
         {inChat ? <ChatScreen chat={chat} /> : <ConnectScreen chat={chat} />}
       </View>
     </View>

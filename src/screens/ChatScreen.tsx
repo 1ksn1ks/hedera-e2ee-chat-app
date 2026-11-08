@@ -12,7 +12,8 @@ import {
   View,
 } from 'react-native';
 import type { ViewToken } from '@react-native/virtualized-lists';
-import { baseStyles, colors, glassCard } from '../theme';
+import { baseStyles, colors, radius } from '../theme';
+import { Icon } from '../components/Icon';
 import { Bubble, formatStamp, type E2eeChat } from '../hooks/useE2eeChat';
 import { MessageBubble } from '../components/MessageBubble';
 import { Composer } from '../components/Composer';
@@ -20,6 +21,7 @@ import { RelayStatus } from '../components/RelayStatus';
 import { editOutgoingBytes, sendOutgoingBytes } from '../services/chatPayload';
 import { nearKeysForView } from '../services/decryptSlots';
 import { packFitting, type SealedMedia } from '../services/sealedMedia';
+import { displayName } from '../services/identity';
 import {
   holdPreview,
   MEDIA_BLOCKED,
@@ -39,6 +41,28 @@ interface Row {
   bubble: Bubble;
   showAvatar: boolean;
   showHeader: boolean;
+  // Set on the first message of a new day: the divider label above it.
+  day: string;
+}
+
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+function dayKey(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '';
+  return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+}
+
+// Today / Yesterday / 6 Nov 2026, in the phone's own time zone.
+function dayLabel(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '';
+  const now = new Date();
+  const key = dayKey(iso);
+  if (key === dayKey(now.toISOString())) return 'Today';
+  const yesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+  if (key === dayKey(yesterday.toISOString())) return 'Yesterday';
+  return `${d.getDate()} ${MONTHS[d.getMonth()]} ${d.getFullYear()}`;
 }
 
 interface Props {
@@ -51,11 +75,16 @@ export function ChatScreen({ chat }: Props) {
   const [draft, setDraft] = useState<DraftMedia | null>(null);
   const [attachBusy, setAttachBusy] = useState(false);
   const listRef = useRef<FlatList<Row>>(null);
+  // Open at the newest message; follow new ones only while the reader is
+  // already near the bottom, so scrolling back through history isn't yanked.
+  const atBottomRef = useRef(true);
   const [nearKeys, setNearKeys] = useState<Set<string>>(() => new Set());
   const nearKeysRef = useRef(nearKeys);
   nearKeysRef.current = nearKeys;
 
   const topic = chat.meta?.topicId || '';
+  const via = chat.meta?.via || '';
+  const myName = chat.account ? displayName(chat.profiles[chat.account]) : '';
 
   const flash = useCallback((text: string) => {
     setNotice(text);
@@ -157,12 +186,19 @@ export function ChatScreen({ chat }: Props) {
   );
 
   // Grouping: the avatar + name show on the first message of a payer run.
+  // A new day starts a new run under its own divider.
   const rows = useMemo(
     () =>
       chat.bubbles.map((b, i) => {
         const prev = i > 0 ? chat.bubbles[i - 1] : null;
-        const newGroup = !prev || prev.payer !== b.payer;
-        return { bubble: b, showAvatar: newGroup, showHeader: newGroup };
+        const newDay = !prev || dayKey(prev.created) !== dayKey(b.created);
+        const newGroup = !prev || prev.payer !== b.payer || newDay;
+        return {
+          bubble: b,
+          showAvatar: newGroup,
+          showHeader: newGroup,
+          day: newDay ? dayLabel(b.created) : '',
+        };
       }),
     [chat.bubbles]
   );
@@ -190,62 +226,109 @@ export function ChatScreen({ chat }: Props) {
     }
   ).current;
 
+  // Rows repaint when a profile card or the near set changes.
+  const listExtra = useMemo(() => ({ nearKeys, profiles: chat.profiles }), [nearKeys, chat.profiles]);
+
   const composerDisabled = !chat.account || chat.unlock.status !== 'unlocked';
+  const placeholder = !chat.account ? 'Connect a wallet to send' : 'Encrypted message';
+  // A domain or payer opened the chat: show that name, with the id below.
+  // A person's chat (opened by tapping them, or your own on login) shows
+  // their username when they have one.
+  const viaName = via && chat.profiles[via] ? displayName(chat.profiles[via]) || via : via;
+  const title = viaName || topic;
+  const who = chat.account ? myName || chat.account : 'read-only';
 
   return (
     <View style={baseStyles.screen}>
-      <View style={[styles.header, glassCard, { borderRadius: 0, borderLeftWidth: 0, borderRightWidth: 0, borderTopWidth: 0 }]}>
-        <Pressable onPress={chat.leave} hitSlop={8} accessibilityRole="button">
-          <Text style={styles.back}>‹</Text>
+      <View style={styles.header}>
+        <Pressable
+          onPress={chat.leave}
+          hitSlop={8}
+          accessibilityRole="button"
+          accessibilityLabel="Back"
+          style={({ pressed }) => [styles.back, pressed && styles.backPressed]}
+        >
+          <Icon name="back" size={24} color={colors.text} />
         </Pressable>
+        <View style={styles.topicMark}>
+          <Icon name="lock" size={18} color={colors.cyan} />
+        </View>
         <View style={styles.headerMid}>
           <Text style={styles.topic} numberOfLines={1}>
-            {topic}
+            {title}
           </Text>
-          <Text style={styles.lockline}>
-            🔒 end-to-end encrypted{chat.account ? `  ·  ${chat.account}` : '  ·  read-only (no wallet)'}
+          <Text style={styles.lockline} numberOfLines={1}>
+            {via ? `${topic} · ` : ''}End-to-end encrypted · {who}
           </Text>
         </View>
+        <RelayStatus compact useRelay={chat.useRelay} transport={chat.transport} onToggle={chat.setUseRelay} />
       </View>
 
-      <RelayStatus bleed useRelay={chat.useRelay} transport={chat.transport} onToggle={chat.setUseRelay} />
-
-      {notice ? <View style={styles.noticeBar}><Text style={styles.noticeText}>{notice}</Text></View> : null}
-
-      <FlatList<Row>
-        ref={listRef}
-        data={rows}
-        extraData={nearKeys}
-        keyExtractor={(r) => r.bubble.sig}
-        inverted={false}
-        contentContainerStyle={styles.list}
-        viewabilityConfig={viewabilityConfig}
-        onViewableItemsChanged={onViewableItemsChanged}
-        onContentSizeChange={() => listRef.current?.scrollToOffset({ offset: 0, animated: false })}
-        renderItem={({ item }) => (
-          <MessageBubble
-            bubble={item.bubble}
-            showAvatar={item.showAvatar}
-            showHeader={item.showHeader}
-            stamp={formatStamp(item.bubble.created)}
-            canEdit={item.bubble.mine}
-            onEdit={(b) => setEditing(b)}
-            near={nearKeys.has(item.bubble.sig)}
-          />
-        )}
-        ListEmptyComponent={
-          <View style={styles.empty}>
-            <Text style={styles.emptyText}>
-              {chat.unlock.status === 'unlocked'
-                ? 'No messages yet — say hello (wallet needed to send).'
-                : 'Unlock the topic to read its messages.'}
-            </Text>
+      <View style={styles.body}>
+        {notice ? (
+          <View style={styles.notice} pointerEvents="none">
+            <Text style={styles.noticeText}>{notice}</Text>
           </View>
-        }
-      />
+        ) : null}
+
+        <FlatList<Row>
+          ref={listRef}
+          data={rows}
+          extraData={listExtra}
+          keyExtractor={(r) => r.bubble.sig}
+          inverted={false}
+          contentContainerStyle={styles.list}
+          viewabilityConfig={viewabilityConfig}
+          onViewableItemsChanged={onViewableItemsChanged}
+          onScroll={(e) => {
+            const { contentOffset, contentSize, layoutMeasurement } = e.nativeEvent;
+            atBottomRef.current = contentSize.height - (contentOffset.y + layoutMeasurement.height) < 160;
+          }}
+          scrollEventThrottle={64}
+          onContentSizeChange={() => {
+            if (atBottomRef.current) listRef.current?.scrollToEnd({ animated: false });
+          }}
+          renderItem={({ item }) => (
+            <>
+              {item.day ? (
+                <View style={styles.day}>
+                  <Text style={styles.dayText}>{item.day}</Text>
+                </View>
+              ) : null}
+              <MessageBubble
+                bubble={item.bubble}
+                profile={chat.profiles[item.bubble.payer]}
+                showAvatar={item.showAvatar}
+                showHeader={item.showHeader}
+                stamp={formatStamp(item.bubble.created)}
+                canEdit={item.bubble.mine}
+                onEdit={(b) => setEditing(b)}
+                near={nearKeys.has(item.bubble.sig)}
+              />
+            </>
+          )}
+          ListEmptyComponent={
+            <View style={styles.empty}>
+              <View style={styles.emptyMark}>
+                <Icon name="lock" size={26} color={colors.cyan} />
+              </View>
+              <Text style={styles.emptyTitle}>
+                {chat.unlock.status === 'unlocked' ? 'No messages yet' : 'Locked'}
+              </Text>
+              <Text style={styles.emptyText}>
+                {chat.unlock.status === 'unlocked'
+                  ? chat.account
+                    ? 'Say hello. Only holders of the topic key can read it.'
+                    : 'Connect a wallet to send the first message.'
+                  : 'Unlock the topic to read its messages.'}
+              </Text>
+            </View>
+          }
+        />
+      </View>
 
       <Composer
-        placeholder="Encrypted message…"
+        placeholder={placeholder}
         disabled={composerDisabled}
         busy={attachBusy}
         busyLabel={attachBusy ? 'Uploading…' : undefined}
@@ -271,58 +354,119 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: 10,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
+    paddingLeft: 6,
+    paddingRight: 12,
+    paddingVertical: 8,
+    minHeight: 60,
     backgroundColor: colors.card,
     borderBottomWidth: 1,
     borderBottomColor: colors.hairline,
   },
   back: {
-    color: colors.cyan,
-    fontSize: 30,
-    lineHeight: 30,
-    fontWeight: '600',
-    paddingHorizontal: 2,
+    width: 40,
+    height: 40,
+    borderRadius: radius.pill,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  backPressed: {
+    backgroundColor: colors.cardRaised,
+  },
+  topicMark: {
+    width: 38,
+    height: 38,
+    borderRadius: 19,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: colors.cyanFaint,
+    borderWidth: 1,
+    borderColor: colors.cyanSoft,
   },
   headerMid: {
     flex: 1,
+    minWidth: 0,
   },
   topic: {
     color: colors.text,
-    fontSize: 15,
+    fontSize: 16,
     fontWeight: '700',
   },
   lockline: {
     color: colors.muted,
-    fontSize: 11,
-    marginTop: 1,
+    fontSize: 12,
+    marginTop: 2,
   },
-  noticeBar: {
-    backgroundColor: colors.cyanFaint,
-    borderBottomWidth: 1,
-    borderBottomColor: colors.cyanSoft,
-    paddingVertical: 6,
-    paddingHorizontal: 14,
+  body: {
+    flex: 1,
+  },
+  notice: {
+    position: 'absolute',
+    top: 10,
+    left: 16,
+    right: 16,
+    zIndex: 2,
+    alignItems: 'center',
   },
   noticeText: {
-    color: colors.cyan,
-    fontSize: 12,
+    color: colors.text,
+    fontSize: 13,
     fontWeight: '600',
+    backgroundColor: colors.cardRaised,
+    borderWidth: 1,
+    borderColor: colors.cyanSoft,
+    borderRadius: radius.pill,
+    overflow: 'hidden',
+    paddingVertical: 8,
+    paddingHorizontal: 14,
   },
   list: {
     flexGrow: 1,
-    paddingBottom: 10,
+    paddingTop: 4,
+    paddingBottom: 12,
+  },
+  day: {
+    alignItems: 'center',
+    paddingTop: 16,
+    paddingBottom: 2,
+  },
+  dayText: {
+    color: colors.textSoft,
+    fontSize: 12,
+    fontWeight: '600',
+    backgroundColor: colors.card,
+    borderWidth: 1,
+    borderColor: colors.hairline,
+    borderRadius: radius.pill,
+    overflow: 'hidden',
+    paddingVertical: 4,
+    paddingHorizontal: 12,
   },
   empty: {
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    padding: 24,
+    padding: 32,
+    gap: 8,
+  },
+  emptyMark: {
+    width: 56,
+    height: 56,
+    borderRadius: 28,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: colors.cyanFaint,
+    marginBottom: 4,
+  },
+  emptyTitle: {
+    color: colors.text,
+    fontSize: 16,
+    fontWeight: '700',
   },
   emptyText: {
     color: colors.muted,
-    fontSize: 13,
+    fontSize: 14,
     textAlign: 'center',
-    lineHeight: 19,
+    lineHeight: 20,
+    maxWidth: 280,
   },
 });

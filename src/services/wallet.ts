@@ -1,20 +1,28 @@
-// Wallet send path — the same WalletConnect / HIP-820 pattern as
-// hedera-notifications-frontend's walletConnect.ts: UniversalProvider with a
+// Wallet send path — WalletConnect / HIP-820: UniversalProvider with a
 // `hedera` namespace, pairing via the display_uri event, account read from
-// the session. Sending is `hedera_signAndExecuteTransaction`: the dApp
-// builds the unsigned HCS transaction, the EXTERNAL wallet signs it and pays
-// the network fee. No custodial key ever touches this app, no IAP packs.
-import {
-  AccountId,
-  Client,
-  TopicId,
-  TopicMessageSubmitTransaction,
-} from '@hashgraph/sdk';
+// the session. Sending is `hedera_signAndExecuteTransaction` with the same
+// request the Globe map's wallet library sends (@hashgraph/hedera-wallet-connect
+// DAppSigner): the dApp freezes the HCS transaction for the connected
+// account, the EXTERNAL wallet signs it, executes it and pays the network
+// fee. No custodial key ever touches this app, no IAP packs.
+import { Transaction, TransactionId } from '@hashgraph/sdk';
 import UniversalProvider from '@walletconnect/universal-provider';
 import { signatureBytesFromWallet } from './sealedMedia';
+import {
+  bytesToBase64,
+  chunkCount,
+  freezeChunk,
+  freezeSingle,
+  HCS_MAX_CHUNKS,
+  pickNode,
+  signAndExecuteParams,
+} from './hcsTx';
 
 // Same WalletConnect Cloud project as the notifications app.
 const PROJECT_ID = '4bb3a1d4a8c30b0e3b1bd4c7285330b6';
+
+// CAIP-2 chain of every request (DAppSigner ledgerIdToCAIPChainId).
+const CHAIN = 'hedera:mainnet';
 
 const HEDERA_METHODS = [
   'hedera_signMessage',
@@ -98,42 +106,42 @@ export async function disconnectWallet(): Promise<void> {
   accountCache = null;
 }
 
-function hexEncode(text: string): string {
-  return Array.from(new TextEncoder().encode(text))
-    .map((byte) => byte.toString(16).padStart(2, '0'))
-    .join('');
-}
-
-// HIP-820. The wallet signs the nonce, and the upload server wants the raw
-// 64-byte signature (it also accepts the Hedera signed-message prefix).
+// HIP-820. The wallet signs the nonce text itself (the Globe map signs
+// TextEncoder(nonce) the same way), and the upload server checks the raw
+// 64-byte signature over that text, with or without the Hedera
+// signed-message prefix.
 export async function signUploadNonce(nonce: string): Promise<string> {
   if (!provider?.session) throw new Error('Connect your wallet to upload');
   const account = await getConnectedAccount();
   if (!account) throw new Error('Connect your wallet to upload');
-  const result: unknown = await provider.request({
-    method: 'hedera_signMessage',
-    params: [{ message: hexEncode(nonce) }],
-    account: `hedera:mainnet:${account}`,
-  });
+  const result: unknown = await provider.request(
+    {
+      method: 'hedera_signMessage',
+      params: { signerAccountId: `${CHAIN}:${account}`, message: nonce },
+    },
+    CHAIN
+  );
   const bytes = signatureBytesFromWallet(result);
   if (!bytes || bytes.length !== 64) throw new Error('Upload failed, please try again');
   return bytesToBase64(bytes);
 }
 
-// Base64 without Node's Buffer (RN has none): chunked btoa.
-function bytesToBase64(bytes: Uint8Array): string {
-  let binary = '';
-  const CHUNK = 0x8000;
-  for (let i = 0; i < bytes.length; i += CHUNK) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
-  }
-  return btoa(binary);
+// DAppSigner._tryExecuteTransactionRequest: the frozen transaction as a
+// base64 TransactionList, signed by the session account on hedera:mainnet.
+async function signAndExecute(tx: Transaction, account: string): Promise<string> {
+  const result: any = await provider.request(
+    { method: 'hedera_signAndExecuteTransaction', params: signAndExecuteParams(tx, CHAIN, account) },
+    CHAIN
+  );
+  return result && typeof result === 'object'
+    ? String(result.transactionId ?? result.txId ?? '')
+    : String(result ?? '');
 }
 
-// Submit a body to the topic through the connected wallet: build the
-// unsigned TopicMessageSubmitTransaction, hand it to the wallet, which
-// signs (hedera_signAndExecuteTransaction) and executes it. Returns the
-// transaction id when the wallet reports one.
+// Submit a body to the topic through the connected wallet. Each body (one,
+// or one per 1024-byte chunk) is frozen for the session account and sent
+// with hedera_signAndExecuteTransaction; the wallet signs, executes and
+// pays. Returns the last transaction id the wallet reports.
 export async function sendTopicMessage(
   topicId: string,
   jsonBody: string
@@ -142,31 +150,32 @@ export async function sendTopicMessage(
   const account = await getConnectedAccount();
   if (!account) throw new Error('Wallet connected but no Hedera account in session');
 
-  const client = Client.forMainnet();
-  try {
-    // 2.81: the node map is a public property (getNetwork() was removed).
-    const network = (client as unknown as { _network: Record<string, string> })._network;
-    const nodes = Object.values(network || {});
-    if (!nodes.length) throw new Error('No relay network available');
-    const node = nodes[Math.floor(Math.random() * nodes.length)];
+  const message = new TextEncoder().encode(jsonBody);
+  const total = chunkCount(message);
+  if (total > HCS_MAX_CHUNKS) throw new Error('Message too long for Hedera');
+  const node = pickNode();
 
-    const tx = new TopicMessageSubmitTransaction()
-      .setTopicId(TopicId.fromString(topicId))
-      .setMessage(jsonBody)
-      .setNodeAccountIds([AccountId.fromString(node)]);
-
-    const body = bytesToBase64(new Uint8Array(tx.toBytes()));
-
-    const result: any = await provider.request({
-      method: 'hedera_signAndExecuteTransaction',
-      params: [{ transaction: body }],
-      account: `hedera:mainnet:${account}`,
-    });
-
-    return result && typeof result === 'object'
-      ? String(result.transactionId ?? result.txId ?? '')
-      : String(result ?? '');
-  } finally {
-    await client.close();
+  if (total === 1) {
+    const tx = freezeSingle({ topicId, message, node, transactionId: TransactionId.generate(account) });
+    return signAndExecute(tx, account);
   }
+
+  // Each approval gets its own valid-start; chunk 1's id stays the
+  // initial transaction id of every part (hedera.js sendMessage).
+  let initialTransactionId: TransactionId | null = null;
+  let sent = 0;
+  let last = '';
+  for (let number = 1; number <= total; number++) {
+    const transactionId = TransactionId.generate(account);
+    if (!initialTransactionId) initialTransactionId = transactionId;
+    const part = freezeChunk({ topicId, message, node, transactionId, initialTransactionId, number, total });
+    try {
+      last = await signAndExecute(part, account);
+      sent += 1;
+    } catch (e: any) {
+      const why = e?.message ? ` (${e.message})` : '';
+      throw new Error(`Sent ${sent} of ${total} parts, so this message won't appear. Send it again to retry.${why}`);
+    }
+  }
+  return last;
 }

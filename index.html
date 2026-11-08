@@ -7,7 +7,14 @@
     <title>Hedera E2EE Chat</title>
     <style>
       html, body, #root { height: 100%; margin: 0; }
-      body { background: #0a0a0a; }
+      /* react-native-web sizes the app with flex: 1, so the root must be a flex
+         container; otherwise the chat grows past the window and the composer
+         scrolls away instead of staying docked. */
+      #root { display: flex; flex-direction: column; }
+      body { background: #07090c; -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
+      /* Dark, thin scrollbars to match the app on desktop browsers. */
+      :root { color-scheme: dark; }
+      * { scrollbar-width: thin; scrollbar-color: #2a303c transparent; }
     </style>
   </head>
   <body>

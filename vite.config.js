@@ -29,7 +29,9 @@ export default defineConfig({
     // Prefer the packages' .web.js variants (e.g. react-native-safe-area-context
     // ships browser implementations as NativeSafeAreaProvider.web.js /
     // SafeAreaView.web.js); fall through to the normal extensions otherwise.
-    extensions: ['.web.js', '.mjs', '.js', '.mts', '.ts', '.jsx', '.tsx', '.json'],
+    // The app's own .web.tsx / .web.ts files (e.g. src/components/Icon.web.tsx)
+    // win the same way; Metro ignores them on phones.
+    extensions: ['.web.tsx', '.web.ts', '.web.js', '.mjs', '.js', '.mts', '.ts', '.jsx', '.tsx', '.json'],
     alias: [
       // react-native-svg's fabric components call this at module load; the real
       // RN file is Flow + native-bridge and cannot load in a browser.
@@ -40,8 +42,8 @@ export default defineConfig({
       // Keychain has no native bridge in the browser — the stub keeps the key
       // in module memory only (never localStorage): a reload re-unlocks.
       {
-        find: '@react-native-keychain',
-        replacement: path.resolve(__dirname, 'web-stubs/keychain.js'),
+        find: /^react-native-keychain$/,
+        replacement: path.resolve(__dirname, 'web-stubs/keychain.ts'),
       },
       // Exact match only, so 'react-native/...' subpaths are not swallowed.
       { find: /^react-native$/, replacement: path.resolve(__dirname, 'web-shims/react-native.js') },
