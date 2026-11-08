@@ -52,11 +52,30 @@ src/services/chatPayload.ts  payload pack/unpack + 18 KB gate math
 src/services/backend.ts  /api/messages + SSE (re-subscribe on topic change) + /api/submit
 src/services/secretStore.ts  Keystore/Keychain topic keys
 src/services/wallet.ts   WalletConnect/HIP-820 pairing + topic submit
+src/services/identity.ts profiles, domains, following, topic-input rules (Globe's, ported)
+src/services/identityFetch.ts  /api/user-settings, /api/following, or the same topics off the mirror
 src/hooks/useE2eeChat.ts engine: unlock, ingest, live, pending, edit map
-src/screens/             ConnectScreen (topic + unlock + wallet), ChatScreen (messenger)
-src/components/          MessageBubble (grouped, edited mark), Composer (byte counter, edit mode)
+src/hooks/useIdentity.ts profiles every 30s, domains, following per wallet
+src/screens/             ConnectScreen (topic/domain/payer + following + unlock + wallet), ChatScreen (messenger)
+src/components/          MessageBubble (grouped, avatar + name, edited mark), Composer (byte counter, edit mode)
 android/, ios/           native shells (renamed from the notifications app)
 ```
+
+## Install a test build (Android)
+
+Every push to `main` builds an installable APK in GitHub Actions
+(`.github/workflows/android-apk.yml`) and publishes it as the
+`android-latest` pre-release. On the phone, open:
+
+https://github.com/1ksn1ks/hedera-e2ee-chat-app/releases/download/android-latest/hedera-e2ee-chat.apk
+
+then open the downloaded file and allow installing from that source. Builds
+are signed with the committed test key (`android/app/e2ee-test.p12`), so each
+one installs over the last and keeps the saved topic keys. That key is public
+on purpose and only for test builds: store builds use the private upload key
+from `android/keystore.properties` (never committed). Because the keys
+differ, uninstall the test build before installing the store one. iOS has
+no GitHub install path; test it through TestFlight.
 
 ## Run it
 

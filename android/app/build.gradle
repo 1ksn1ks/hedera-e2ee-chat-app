@@ -79,11 +79,16 @@ android {
 
     namespace "com.hederae2eechat"
     defaultConfig {
-        applicationId "com.hedera.notificationapp"
+        // Its own id: the notifications app is com.hedera.notificationapp, and
+        // sharing it would make the two apps overwrite each other. Final once
+        // the app is in a store.
+        applicationId "com.hederae2eechat"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 8
-        versionName "4.4"
+        // GitHub Actions sets these from the run number, so every test APK
+        // installs over the previous one.
+        versionCode((System.getenv("APP_VERSION_CODE") ?: "1").toInteger())
+        versionName(System.getenv("APP_VERSION_NAME") ?: "0.1.0")
         externalNativeBuild {
             cmake {
                 arguments "-DCMAKE_OBJECT_PATH_MAX=1024"
@@ -103,6 +108,19 @@ android {
             keyAlias 'androiddebugkey'
             keyPassword 'android'
         }
+        // Test builds only (GitHub Actions, and local release builds without
+        // keystore.properties). Committed on purpose, like React Native's
+        // debug.keystore, so each test APK installs over the last one and keeps
+        // its saved topic keys. Anyone can sign with it: never use it for a
+        // store build.
+        test {
+            storeFile file('e2ee-test.p12')
+            storeType 'pkcs12'
+            storePassword 'e2eetest'
+            keyAlias 'e2eetest'
+            keyPassword 'e2eetest'
+        }
+        // Store builds: the real upload key, kept out of git (keystore.properties).
         release {
             if (keystorePropertiesFile.exists()) {
                 storeFile file(keystoreProperties['storeFile'])
@@ -117,7 +135,7 @@ android {
             signingConfig signingConfigs.debug
         }
         release {
-            signingConfig signingConfigs.release
+            signingConfig keystorePropertiesFile.exists() ? signingConfigs.release : signingConfigs.test
             minifyEnabled enableProguardInReleaseBuilds
             proguardFiles getDefaultProguardFile("proguard-android.txt"), "proguard-rules.pro"
         }
@@ -134,5 +152,3 @@ dependencies {
         implementation jscFlavor
     }
 }
-
-apply plugin: "com.google.gms.google-services"

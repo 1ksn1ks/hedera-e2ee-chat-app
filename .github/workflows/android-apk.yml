@@ -1,0 +1,79 @@
+# Installable Android test build on every push to main.
+#
+# Builds the release APK (JS bundled in, no dev server needed), signed with
+# the committed TEST key (android/app/e2ee-test.p12) so each build installs
+# over the previous one, and publishes it as the "android-latest" pre-release:
+#   https://github.com/1ksn1ks/hedera-e2ee-chat-app/releases/download/android-latest/hedera-e2ee-chat.apk
+# Store builds are not made here: they use the private upload key.
+name: Android test APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-apk
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      APP_VERSION_CODE: ${{ github.run_number }}
+      APP_VERSION_NAME: 0.1.${{ github.run_number }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Install JS dependencies
+        run: npm ci
+
+      - name: Type check and unit tests
+        run: |
+          npm run typecheck
+          npm test
+
+      - name: Build the release APK (test-signed)
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease -PreactNativeArchitectures=arm64-v8a,armeabi-v7a --no-daemon
+
+      - name: Name and verify the APK
+        run: |
+          cp android/app/build/outputs/apk/release/app-release.apk hedera-e2ee-chat.apk
+          BUILD_TOOLS=$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -1)
+          "${BUILD_TOOLS}apksigner" verify --print-certs hedera-e2ee-chat.apk
+          "${BUILD_TOOLS}aapt2" dump badging hedera-e2ee-chat.apk | head -1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hedera-e2ee-chat-${{ github.run_number }}
+          path: hedera-e2ee-chat.apk
+
+      - name: Publish as the android-latest test build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete android-latest --yes --cleanup-tag || true
+          gh release create android-latest hedera-e2ee-chat.apk \
+            --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "Android test build ${APP_VERSION_NAME}" \
+            --notes "Test build ${APP_VERSION_NAME} from ${GITHUB_SHA::7}. On the phone: download hedera-e2ee-chat.apk, open it, allow installing from this source. Each build installs over the previous one (same test signing key). Not a store build."
