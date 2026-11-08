@@ -169,7 +169,10 @@ test('a 401 signs once and retries the same ciphertext', async () => {
   assert.equal(storage.get('upload-grant:0.0.9')?.includes('signed-token'), true);
 });
 
-test('globe decrypts the bytes this app would upload', async () => {
+test(
+  'globe decrypts the bytes this app would upload',
+  { skip: existsSync(resolve(process.cwd(), '../step_by_step/e2eemedia.js')) ? false : 'needs the step_by_step checkout next to this repo' },
+  async () => {
   const globePath = resolve(process.cwd(), '../step_by_step/e2eemedia.js');
   assert.equal(existsSync(globePath), true);
   const globe = (await import(pathToFileURL(globePath).href)) as {

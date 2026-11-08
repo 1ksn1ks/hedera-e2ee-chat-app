@@ -35,6 +35,9 @@ const VIDEO = 'https://cdn.example/markers/12-ab.mp4';
 const POSTER = 'data:image/jpeg;base64,/9j/4AAQ';
 const GLOBE_THUMB = resolve(process.cwd(), '../step_by_step/videoposter.js');
 const GLOBE_MEDIA = resolve(process.cwd(), '../step_by_step/e2eemedia.js');
+// Cross-repo checks import the Globe map's own code from the step_by_step
+// checkout next to this repo. Where it is absent (GitHub Actions) they skip.
+const NO_GLOBE = existsSync(GLOBE_MEDIA) ? false : 'needs the step_by_step checkout next to this repo';
 
 const EMBEDDED =
   '\u001echat1\n{"t":"hello\\nthere","i":"https://cdn.example/markers/12-ab.mp4","p":"data:image/jpeg;base64,/9j/4AAQ"}';
@@ -102,7 +105,7 @@ test('old plain {t,i} image links still parse', () => {
   assert.equal(readSealedMedia(raw), null);
 });
 
-test('sealed pack matches step_by_step and both sides decrypt', async () => {
+test('sealed pack matches step_by_step and both sides decrypt', { skip: NO_GLOBE }, async () => {
   assert.equal(existsSync(GLOBE_MEDIA), true);
   await sealedReady();
   const globe = (await import(pathToFileURL(GLOBE_MEDIA).href)) as {
@@ -667,7 +670,7 @@ test('sealed stills decrypt only near the screen, two at a time', async () => {
   assert.equal(gate.queued(), 0);
 });
 
-test('gif:1 is kept through normalize and pack, matching Globe', async () => {
+test('gif:1 is kept through normalize and pack, matching Globe', { skip: NO_GLOBE }, async () => {
   assert.equal(existsSync(GLOBE_MEDIA), true);
   await sealedReady();
   const globe = (await import(pathToFileURL(GLOBE_MEDIA).href)) as {
