@@ -52,11 +52,31 @@ jobs:
           npm run typecheck
           npm test
 
+      # 4 GB heap: GitHub runners have 16 GB, and the 2 GB in gradle.properties
+      # is tight for a release build (R8/lint/Hermes) of a React Native app.
       - name: Build the release APK (test-signed)
         working-directory: android
         run: |
           chmod +x gradlew
-          ./gradlew assembleRelease -PreactNativeArchitectures=arm64-v8a,armeabi-v7a --no-daemon
+          set -o pipefail
+          ./gradlew assembleRelease \
+            -PreactNativeArchitectures=arm64-v8a,armeabi-v7a \
+            "-Dorg.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g" \
+            --no-daemon --stacktrace 2>&1 | tee gradle.log
+
+      # Job logs need a signed-in admin; annotations are public. Put Gradle's
+      # own explanation of a failure into one so it can be read anywhere.
+      - name: Show why Gradle failed
+        if: failure()
+        working-directory: android
+        run: |
+          [ -f gradle.log ] || exit 0
+          {
+            awk '/What went wrong:/{f=1} f{print} /\* Try:/{f=0}' gradle.log | head -40
+            grep -E "^e: |error:|FAILED|CMake Error|ninja: build stopped|Execution failed|OutOfMemory|Java heap" gradle.log | head -30
+          } > why.txt
+          msg=$(sed 's/%/%25/g; s/\r//g' why.txt | awk '{printf "%s%%0A", $0}')
+          echo "::error title=Gradle build failed::${msg}"
 
       - name: Name and verify the APK
         run: |
