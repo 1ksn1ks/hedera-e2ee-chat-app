@@ -100,6 +100,30 @@ android {
     if (keystorePropertiesFile.exists()) {
         keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
     }
+    def testKeystorePropertiesFile = rootProject.file("test-keystore.properties")
+    def testKeystoreProperties = new Properties()
+    if (testKeystorePropertiesFile.exists()) {
+        testKeystoreProperties.load(new FileInputStream(testKeystorePropertiesFile))
+    }
+    def pickTest = { String projectProp, String envName, String fileKey ->
+        def fromProp = project.findProperty(projectProp)
+        if (fromProp != null && fromProp.toString().trim()) return fromProp.toString()
+        def fromEnv = System.getenv(envName)
+        if (fromEnv != null && fromEnv.trim()) return fromEnv
+        def fromFile = testKeystoreProperties.getProperty(fileKey)
+        if (fromFile != null && fromFile.trim()) return fromFile
+        return null
+    }
+    def testKeystorePath = pickTest("testKeystore", "TEST_KEYSTORE", "storeFile")
+    def testStorePassword = pickTest("testStorePassword", "TEST_STORE_PASSWORD", "storePassword")
+    def testKeyAlias = pickTest("testKeyAlias", "TEST_KEY_ALIAS", "keyAlias")
+    def testKeyPassword = pickTest("testKeyPassword", "TEST_KEY_PASSWORD", "keyPassword")
+    def testSigningReady = testKeystorePath && testStorePassword && testKeyAlias && testKeyPassword && file(testKeystorePath).exists()
+    def releaseRequested = gradle.startParameter.taskNames.any { taskName ->
+        def n = taskName.toLowerCase()
+        if (n.contains("debug")) return false
+        n.contains("release") || n.contains("bundle") || n == "assemble" || n.endsWith(":assemble") || n == "build" || n.endsWith(":build")
+    }
 
     signingConfigs {
         debug {
@@ -108,17 +132,17 @@ android {
             keyAlias 'androiddebugkey'
             keyPassword 'android'
         }
-        // Test builds only (GitHub Actions, and local release builds without
-        // keystore.properties). Committed on purpose, like React Native's
-        // debug.keystore, so each test APK installs over the last one and keeps
-        // its saved topic keys. Anyone can sign with it: never use it for a
-        // store build.
+        // Test APKs only. The key is not in git. CI passes TEST_KEYSTORE and
+        // the passwords; a local release build without keystore.properties
+        // reads android/test-keystore.properties.
         test {
-            storeFile file('e2ee-test.p12')
-            storeType 'pkcs12'
-            storePassword 'e2eetest'
-            keyAlias 'e2eetest'
-            keyPassword 'e2eetest'
+            if (testSigningReady) {
+                storeFile file(testKeystorePath)
+                storeType "pkcs12"
+                storePassword testStorePassword
+                keyAlias testKeyAlias
+                keyPassword testKeyPassword
+            }
         }
         // Store builds: the real upload key, kept out of git (keystore.properties).
         release {
@@ -135,7 +159,15 @@ android {
             signingConfig signingConfigs.debug
         }
         release {
-            signingConfig keystorePropertiesFile.exists() ? signingConfigs.release : signingConfigs.test
+            if (keystorePropertiesFile.exists()) {
+                signingConfig signingConfigs.release
+            } else if (testSigningReady) {
+                signingConfig signingConfigs.test
+            } else if (releaseRequested) {
+                throw new GradleException("Test signing key is missing. GitHub Actions needs TEST_KEYSTORE, TEST_STORE_PASSWORD, TEST_KEY_ALIAS, and TEST_KEY_PASSWORD. A local release build reads android/test-keystore.properties, which is not committed.")
+            } else {
+                signingConfig signingConfigs.debug
+            }
             minifyEnabled enableProguardInReleaseBuilds
             proguardFiles getDefaultProguardFile("proguard-android.txt"), "proguard-rules.pro"
         }

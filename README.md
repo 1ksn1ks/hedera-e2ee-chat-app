@@ -18,7 +18,7 @@ https://github.com/1ksn1ks/hedera-e2ee-chat-app/releases/download/android-latest
 
 Then open the file and allow installs from that source.
 
-Test builds are signed with the committed `android/app/e2ee-test.p12`, so each one installs over the last and keeps the saved topic keys. That key is public on purpose and is only for test builds. Store builds use the private upload key in `android/keystore.properties`, which is never committed. The two keys differ, so uninstall the test build before installing a store build. There is no GitHub install path for iOS; use TestFlight.
+Test builds are signed with a private test key kept in GitHub Actions secrets, not in the repo, so each one installs over the last and keeps the saved topic keys. The first build after the key change does not: uninstall the old test app once, then unlock the topic again. Store builds use the private upload key in `android/keystore.properties`, which is never committed. The two keys differ, so uninstall the test build before installing a store build. There is no GitHub install path for iOS; use TestFlight.
 
 Package id is `com.hederae2eechat`, separate from the notifier, so the two apps do not overwrite each other.
 

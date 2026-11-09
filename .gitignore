@@ -23,6 +23,7 @@ ios/build/
 !.env.example
 *.keystore
 *.jks
+*.p12
 google-services.json
 GoogleService-Info.plist
 
@@ -31,7 +32,5 @@ GoogleService-Info.plist
 Thumbs.db
 *.log
 
-# The Android TEST signing key is committed on purpose (android/app/build.gradle,
-# signingConfigs.test). Store keys stay ignored above (*.keystore, *.jks).
-!android/app/e2ee-test.p12
 android/keystore.properties
+android/test-keystore.properties
