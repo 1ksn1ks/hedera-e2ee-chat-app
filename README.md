@@ -1,101 +1,135 @@
-# Hedera E2EE Chat
+# 💬 Hedera E2EE Chat
 
-A standalone Play/App Store messenger for **encrypted Hedera consensus topics** (`0.0.x`).
-Signal/Telegram layout — header + grouped bubble list + bottom composer — dark glass, cyan accents.
-No map, no globe, no feed, no NFT gates, no push-notification product.
+A standalone messenger for **encrypted Hedera consensus topics** (`0.0.x`).
 
-## How it relates to the Globe map (step_by_step)
+Header, grouped bubbles, bottom composer. Dark glass, cyan accents. No map, no feed, no NFT gates, and no push product. It speaks the same wire as the globe’s encrypted topic chat, against the same topic-message backend.
 
-Same wire, separate app. The Globe map's encrypted topic chat
-(`encryptedtopicchat.js` + `sodium.js` + `msgbackend.js`) and this app speak
-the exact same protocol against the same topic-message backend:
+**Relay:** [onlyonhbar.com](https://onlyonhbar.com)
 
-| Concern | Wire (identical in both apps) |
+---
+
+## ✨ Features
+
+- **🔐 Sealed topic chat** — `crypto_box_seal` (libsodium, Ed25519 → X25519). Plaintext never goes on chain. A viewer without the topic key sees nothing to read.
+- **✏️ Edit in place** — an edit is a new consensus message that names the original. Clients keep the latest one and rewrite that bubble, with an “edited” mark. Hedera itself stays immutable.
+- **📎 Sealed files** — a picture or video is secretstream-sealed, then uploaded as ciphertext. The topic message carries only the key and the URL. Older clear `{t, i}` links still open and are marked unencrypted.
+- **⚡ Relay, then the mirror** — reads and the live tail prefer the globe relay, with a short timeout and an automatic fall back to the public mirror. A “Hedera only” switch never calls the relay.
+- **👛 Wallet sends** — the app builds the unsigned topic submit. The wallet signs it and pays the HBAR fee. No custodial key and no in-app message packs.
+- **🪪 Same people as the globe** — usernames, pictures, domains, and following come from the globe’s public topics and API.
+
+---
+
+## 🏗️ Architecture
+
+```
+phone app (React Native)
+        │  reads: relay /api/messages + /api/stream, else the mirror
+        │  sends: wallet → Hedera → relay /api/submit (pending)
+        ▼
+topic-message backend (the globe’s server)   ← optional cache, not source of truth
+        │
+        ▼
+Hedera mirror node                            ← source of truth
+```
+
+- A wallet-confirmed send is reported as **pending** so other viewers see it immediately. The mirror confirms it a few seconds later. If the relay is down, the mirror poll still picks the message up.
+- The notifier ([hedera-notifications-frontend](https://github.com/1ksn1ks/hedera-notifications-frontend)) is a different product. It pushes public topics and does not hold these keys.
+
+---
+
+## 🔐 Wire
+
+Same bytes as `encryptedtopicchat.js`, `sodium.js`, and `msgbackend.js` in the globe.
+
+| Concern | On the wire |
 | --- | --- |
-| Message | `{ encryptedMessage: { ciphertext } }` — `crypto_box_seal` (libsodium-sumo, Ed25519→X25519), 48-byte overhead, **unpadded** base64. Plaintext never goes on chain. |
-| Edit own | `{ editEncryptedMessage: { created, timestamp, encryptedMessage, image? } }` — a *new* message naming the original by ISO `created`. HCS is immutable, so clients keep a latest-wins map per `payer\|created`, decrypt the new text and **rewrite the rendered bubble in place** with an "edited" mark. |
-| Edit gates | wrong key / malformed ciphertext / other payer / stale envelope (`at <= created`) → rejected; a pending edit never replaces a known one. |
-| Payload | `packChatPayload`: raw text, or `\x1echat1\n` + JSON `{t, i}` once an image is attached. |
-| Byte gate | 18 KB HCS ceiling measured on the **final outgoing JSON**; the live counter predicts it exactly (fixed 48-byte seal + unpadded-base64 math) before encrypting. |
-| Live | SSE `GET /api/stream?topics=…` — one shared connection; when the topic set changes the connection reopens once with the full list (a live EventSource can't grow its list). Events: `pending` / `message` / `confirmed` / `expired`. |
-| Keys | Topic public key = the admin-pinned `{ publicKey }` message in history (DER hex, last 32 bytes). Private key = DER hex, last 32 bytes are the ed25519 seed. Admin-pinned `{ encryptedPrivateKey, nonce, salt }` (URLSAFE_NO_PADDING base64) unlocks with a password via argon2id pwhash + secretbox. |
+| Message | `{ encryptedMessage: { ciphertext } }` — `crypto_box_seal`, 48-byte overhead, unpadded base64 |
+| Edit own | `{ editEncryptedMessage: { created, timestamp, encryptedMessage, image? } }` — a new message naming the original by ISO `created`. Latest wins per `payer\|created` |
+| Edit gates | Wrong key, malformed ciphertext, another payer, or a stale envelope (`at <= created`) is rejected. A pending edit never replaces a known one |
+| Payload | Raw text, or `\x1echat1\n` plus JSON. A sealed file is `{t, m}` (`url`, `fileKey`, `header`, `mime`, `size`, and optional `w`, `h`, `poster`). An older `{t, i}` link still unpacks |
+| Byte gate | 18 KB measured on the final outgoing JSON. The counter predicts it (fixed 48-byte seal, unpadded base64) before encrypting |
+| Live | `GET /api/stream?topics=…` — one connection. A topic-list change reopens it with the full list. Events: `pending`, `message`, `confirmed`, `expired` |
+| Keys | Topic public key is the admin-pinned `{ publicKey }` (DER hex, last 32 bytes). The private key is DER hex; the last 32 bytes are the Ed25519 seed. `{ encryptedPrivateKey, nonce, salt }` unlocks with a password (argon2id + secretbox) |
 | Stamps | `dd/mm/yy HH:MM` |
 
-The notifications apps (`hedera-notifications-backend` / `-frontend`) are a
-separate product (FCM push for public topics) and are untouched by this app.
+---
 
-## Security model
+## 🛡️ Keys
 
-- **Unlock**: the unwrapped topic private key lives in the platform keystore
-  (iOS Keychain / Android Keystore via `react-native-keychain`, gated by the
-  device passcode). Never in AsyncStorage, never long-lived in JS state.
-  In the browser preview the keychain resolves to an **in-memory** stub — a
-  reload drops the key and forces a re-unlock (by design).
-- **Send**: external wallet only. The app builds the unsigned
-  `TopicMessageSubmitTransaction`, the wallet signs and pays the HBAR network
-  fee (`hedera_signAndExecuteTransaction`, HIP-820 — the same WalletConnect
-  pattern as `hedera-notifications-frontend`). No custodial key, no IAP
-  message packs.
-- **Read**: requires the topic key (password unwrap or key import). A viewer
-  without the key sees an empty list — ciphertext only, nothing to decrypt.
+- **Unlock.** The unwrapped topic private key lives in the platform keystore (iOS Keychain / Android Keystore, gated by the device passcode). Never in AsyncStorage, and not kept in JS state. In the browser preview the keychain is an in-memory stub: a reload drops the key and asks for it again.
+- **Send.** External wallet only (`hedera_signAndExecuteTransaction`, HIP-820).
+- **Read.** Password unwrap or key import. Without the key the list stays empty.
 
-## Layout
+---
 
-```
-App.tsx                  state machine: connect/unlock → chat
-index.js                 RN entry (polyfills + AppRegistry)
-web/main.tsx             browser-preview entry (Vite)
-web-shims/, web-stubs/   browser stand-ins (keychain = in-memory)
-src/theme.ts             dark glass + cyan palette
-src/services/sodium.ts   crypto (port of step_by_step/sodium.js)
-src/services/chatPayload.ts  payload pack/unpack + 18 KB gate math
-src/services/backend.ts  /api/messages + SSE (re-subscribe on topic change) + /api/submit
-src/services/secretStore.ts  Keystore/Keychain topic keys
-src/services/wallet.ts   WalletConnect/HIP-820 pairing + topic submit
-src/services/identity.ts profiles, domains, following, topic-input rules (Globe's, ported)
-src/services/identityFetch.ts  /api/user-settings, /api/following, or the same topics off the mirror
-src/hooks/useE2eeChat.ts engine: unlock, ingest, live, pending, edit map
-src/hooks/useIdentity.ts profiles every 30s, domains, following per wallet
-src/screens/             ConnectScreen (topic/domain/payer + following + unlock + wallet), ChatScreen (messenger)
-src/components/          MessageBubble (grouped, avatar + name, edited mark), Composer (byte counter, edit mode)
-android/, ios/           native shells (renamed from the notifications app)
-```
+## 🧰 Tech stack
 
-## Install a test build (Android)
+| Layer | Stack |
+| --- | --- |
+| **App** | React Native 0.86, TypeScript, React Native Web |
+| **Crypto** | libsodium-wrappers-sumo (`crypto_box_seal`, secretstream for files) |
+| **Keys** | `react-native-keychain` |
+| **Wallet** | WalletConnect, `@hashgraph/sdk` |
+| **Browser preview** | Vite on port 5175 |
+| **Relay** | The globe backend at [onlyonhbar.com](https://onlyonhbar.com). Mirror fallback is `mainnet-public.mirrornode.hedera.com` |
 
-Every push to `main` builds an installable APK in GitHub Actions
-(`.github/workflows/android-apk.yml`) and publishes it as the
-`android-latest` pre-release. On the phone, open:
+---
 
-https://github.com/1ksn1ks/hedera-e2ee-chat-app/releases/download/android-latest/hedera-e2ee-chat.apk
+## 🚀 Getting started
 
-then open the downloaded file and allow installing from that source. Builds
-are signed with the committed test key (`android/app/e2ee-test.p12`), so each
-one installs over the last and keeps the saved topic keys. That key is public
-on purpose and only for test builds: store builds use the private upload key
-from `android/keystore.properties` (never committed). Because the keys
-differ, uninstall the test build before installing the store one. iOS has
-no GitHub install path; test it through TestFlight.
-
-## Run it
+Node `>= 22.11.0`.
 
 ```bash
 npm install
-npm run start:web    # browser preview on :5175, /api proxied to 127.0.0.1:8787
+npm run start:web    # browser preview on :5175
+npm test             # wire, mirror, transport, payload, media
 npm run typecheck    # tsc --noEmit
-npm run android      # device build (needs Android SDK; iOS: pod install)
+npm run android      # device build (iOS: pod install, then npm run ios)
 ```
 
-The preview expects the topic-message backend (step_by_step's `server/`) on
-`127.0.0.1:8787`; point `vite.config.js` → `server.proxy['/api'].target`
-elsewhere (or set `window.__E2EE_BACKEND_URL__`) to use another instance.
+The app calls `https://onlyonhbar.com` unless `globalThis.__E2EE_BACKEND_URL__` is set. An empty string stays on the page origin. The Vite preview proxies `/api` to `http://127.0.0.1:8787`, so that empty override uses a local copy of the globe server. If 5175 is taken, Vite prints the port it picked.
 
-## Verified (headless, web preview, real backend + real crypto)
+### Install a test build (Android)
 
-20/20: connect screen → keygen/seal in-page (libsodium WASM) → key-import
-unlock → history decrypt/render → `dd/mm/yy HH:MM` stamps → SSE live message
-→ SSE edit directive rewrites in place with the "edited" mark (no second
-bubble) → 18 KB gate blocks oversized sends → wrong key renders nothing.
-Not covered headless: the wallet pairing round-trip and the on-device
-Keystore (phone-only paths; the pairing URI flow and keychain calls are the
-same pattern as the notifications app).
+Every push to `main` builds an APK (`.github/workflows/android-apk.yml`) and publishes it as the `android-latest` pre-release. On the phone, open:
+
+https://github.com/1ksn1ks/hedera-e2ee-chat-app/releases/download/android-latest/hedera-e2ee-chat.apk
+
+Then open the file and allow installs from that source.
+
+Test builds are signed with the committed `android/app/e2ee-test.p12`, so each one installs over the last and keeps the saved topic keys. That key is public on purpose and is only for test builds. Store builds use the private upload key in `android/keystore.properties`, which is never committed. The two keys differ, so uninstall the test build before installing a store build. There is no GitHub install path for iOS; use TestFlight.
+
+Package id is `com.hederae2eechat`, separate from the notifier, so the two apps do not overwrite each other.
+
+---
+
+## 📁 Project structure
+
+```
+App.tsx                     connect and unlock, then the chat
+index.js                    React Native entry
+web/main.tsx                browser preview entry
+src/theme.ts                dark glass and cyan
+src/services/sodium.ts      seal and open (port of the globe’s sodium.js)
+src/services/chatPayload.ts pack, unpack, and the 18 KB gate
+src/services/sealedMedia.ts secretstream files and the {t, m} envelope
+src/services/backend.ts     /api/messages, /api/stream, /api/submit
+src/services/transport.ts   relay, timeout, mirror fallback
+src/services/mirror.ts      direct mirror history and live tail
+src/services/secretStore.ts Keystore / Keychain topic keys
+src/services/wallet.ts      WalletConnect pairing and topic submit
+src/services/identity.ts    profiles, domains, following
+src/hooks/useE2eeChat.ts    unlock, ingest, live tail, edits
+src/screens/                ConnectScreen, ChatScreen
+src/components/             MessageBubble, Composer, RelayStatus
+android/, ios/              native shells
+```
+
+---
+
+## 📝 Notes
+
+- The mirror node is the source of truth. The relay is a cache, the same one the globe uses. Hedera-only mode never contacts it.
+- A sealed upload is `application/octet-stream` with `X-Sealed: 1`. The real type stays inside the encrypted envelope.
+- Decrypted pictures and video stay in memory on the web, and in an app cache file on the phone. Both are dropped when the chat closes or the key locks.
+- The browser preview cannot exercise the on-device keystore or the wallet round-trip. Those follow the same WalletConnect pattern as the notifier.
