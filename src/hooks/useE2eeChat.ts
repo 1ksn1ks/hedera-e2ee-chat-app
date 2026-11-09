@@ -46,7 +46,14 @@ import {
 } from '../services/sodium';
 import { releaseHeldMedia } from '../services/mediaCrypto';
 import { loadTopicKey, storeTopicKey } from '../services/secretStore';
-import { connectWallet, disconnectWallet, getConnectedAccount, sendTopicMessage } from '../services/wallet';
+import {
+  connectWallet,
+  disconnectWallet,
+  getConnectedAccount,
+  onWalletSessionEnded,
+  restoreSession,
+  sendTopicMessage,
+} from '../services/wallet';
 import { isTopicId, RESOLVE_EMPTY } from '../services/identity';
 import { useIdentity } from './useIdentity';
 
@@ -130,6 +137,8 @@ export function useE2eeChat() {
   });
   const [account, setAccount] = useState<string | null>(null);
   const [walletBusy, setWalletBusy] = useState(false);
+  // True while the saved wallet session is being looked up at launch.
+  const [walletRestoring, setWalletRestoring] = useState(true);
   const [pairingUri, setPairingUri] = useState<string | null>(null);
   // TRANSPORT: "Use relay server" is on at every launch; turning it off
   // lasts for this session only. `transport` is the path actually in use
@@ -988,6 +997,32 @@ export function useE2eeChat() {
 
   useEffect(() => () => stopLive(), []);
 
+  // Stay logged in: pick up the wallet session saved on this device (like
+  // the Globe map), and log out if the wallet ends it.
+  useEffect(() => {
+    let dead = false;
+    const off = onWalletSessionEnded(() => {
+      if (dead) return;
+      releaseHeldMedia();
+      setAccountBoth(null);
+      setPairingUri(null);
+    });
+    restoreSession()
+      .then((acc) => {
+        if (!dead && acc && !accountRef.current) setAccountBoth(acc);
+      })
+      .catch(() => {
+        // Offline or storage unreadable: start logged out.
+      })
+      .finally(() => {
+        if (!dead) setWalletRestoring(false);
+      });
+    return () => {
+      dead = true;
+      off();
+    };
+  }, []);
+
   return {
     phase,
     meta,
@@ -995,6 +1030,7 @@ export function useE2eeChat() {
     unlock,
     account,
     walletBusy,
+    walletRestoring,
     pairingUri,
     connect,
     openMyChat,

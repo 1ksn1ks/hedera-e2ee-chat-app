@@ -224,6 +224,15 @@ export function ConnectScreen({ chat }: Props) {
     setBusy('');
   };
 
+  // Ends the saved session here and in the wallet.
+  const doDisconnect = async () => {
+    setBusy('wallet');
+    setError('');
+    setMyNote('');
+    await chat.walletDisconnect();
+    setBusy('');
+  };
+
   // The "Open my E2EE chat" button: the topic connected to your profile.
   // No topic on your profile yet is a note, not an error.
   const doMyChat = async () => {
@@ -523,16 +532,37 @@ export function ConnectScreen({ chat }: Props) {
             </Pressable>
           ) : null}
           {chat.account && myNote ? <Text style={styles.myNote}>{myNote}</Text> : null}
-          {chat.account ? null : (
+          {chat.account ? (
+            <Pressable
+              onPress={() => {
+                void doDisconnect();
+              }}
+              disabled={busy === 'wallet'}
+              accessibilityRole="button"
+              hitSlop={6}
+              style={({ pressed }) => [styles.disconnect, pressed && styles.followPressed]}
+            >
+              <Text style={styles.disconnectText}>
+                {busy === 'wallet' ? 'Disconnecting…' : 'Disconnect wallet'}
+              </Text>
+            </Pressable>
+          ) : (
             <>
               <Text style={baseStyles.subtitle}>
                 Sending pays the HBAR network fee through your own wallet. The
-                app never holds your signing key.
+                app never holds your signing key. You stay connected after
+                closing the app, until you disconnect.
               </Text>
               <PrimaryButton
-                label={busy === 'wallet' ? 'Waiting for wallet…' : 'Connect wallet'}
+                label={
+                  chat.walletRestoring
+                    ? 'Checking your wallet…'
+                    : busy === 'wallet'
+                      ? 'Waiting for wallet…'
+                      : 'Connect wallet'
+                }
                 onPress={doWallet}
-                disabled={busy === 'wallet'}
+                disabled={busy === 'wallet' || chat.walletRestoring}
                 ghost
                 icon="wallet"
               />
@@ -798,6 +828,17 @@ const styles = StyleSheet.create({
     color: colors.muted,
     fontSize: 13,
     lineHeight: 18,
+  },
+  disconnect: {
+    alignSelf: 'flex-start',
+    paddingVertical: 6,
+    paddingHorizontal: 4,
+    borderRadius: radius.sm,
+  },
+  disconnectText: {
+    color: colors.danger,
+    fontSize: 13,
+    fontWeight: '600',
   },
   pairingHead: {
     flexDirection: 'row',

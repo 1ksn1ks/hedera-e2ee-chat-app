@@ -31,11 +31,16 @@ const HEDERA_METHODS = [
 ];
 
 let provider: any = null;
+let initRun: Promise<any> | null = null;
 let accountCache: string | null = null;
+const endedListeners = new Set<() => void>();
 
+// One provider for the app's life (a second init warns and duplicates the
+// relay connection). Created on first use, or at launch by restoreSession.
 export async function initProvider(): Promise<any> {
-  if (!provider) {
-    provider = await UniversalProvider.init({
+  if (provider) return provider;
+  if (!initRun) {
+    initRun = UniversalProvider.init({
       projectId: PROJECT_ID,
       metadata: {
         name: 'Hedera E2EE Chat',
@@ -43,9 +48,42 @@ export async function initProvider(): Promise<any> {
         url: 'https://hedera.com',
         icons: ['https://hedera.com/logo.png'],
       },
-    });
+    }).then(
+      (p: any) => {
+        provider = p;
+        // The wallet ended the session (or it expired): log out here too.
+        p.on('disconnect', () => {
+          accountCache = null;
+          for (const fn of [...endedListeners]) fn();
+        });
+        return p;
+      },
+      (err: unknown) => {
+        initRun = null;
+        throw err;
+      }
+    );
   }
-  return provider;
+  return initRun;
+}
+
+// Stay logged in across restarts, like the Globe map: WalletConnect keeps an
+// approved session in app storage (AsyncStorage on phones, IndexedDB in
+// browsers) and the provider picks it up when it starts. Returns that
+// session's account, or null when there is none or it has expired.
+export async function restoreSession(): Promise<string | null> {
+  const p = await initProvider();
+  const session = p.session;
+  if (!session) return null;
+  if (session.expiry && session.expiry * 1000 <= Date.now()) return null;
+  accountCache = readAccount(session);
+  return accountCache;
+}
+
+// Called when the wallet side ends the session. Returns an unsubscribe.
+export function onWalletSessionEnded(fn: () => void): () => void {
+  endedListeners.add(fn);
+  return () => endedListeners.delete(fn);
 }
 
 // Kick off the pairing flow. On web the pairing URI is handed to the UI to
@@ -94,14 +132,15 @@ export function isConnected(): boolean {
   return !!provider?.session;
 }
 
+// Log out: end the session in the wallet too. The provider itself stays, so
+// the next Connect wallet reuses it.
 export async function disconnectWallet(): Promise<void> {
-  if (provider) {
+  if (provider?.session) {
     try {
       await provider.disconnect();
     } catch {
       /* already gone */
     }
-    provider = null;
   }
   accountCache = null;
 }
