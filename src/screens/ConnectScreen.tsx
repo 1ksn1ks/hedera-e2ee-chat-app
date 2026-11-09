@@ -131,6 +131,9 @@ export function ConnectScreen({ chat }: Props) {
   const [busy, setBusy] = useState<'' | 'connect' | 'password' | 'key' | 'wallet' | 'setpw'>('');
   const [error, setError] = useState('');
   const [showAll, setShowAll] = useState(false);
+  // Typing filters only the people you follow. Everyone else shows only
+  // after "Search everyone" is tapped; clearing the field hides them again.
+  const [searchEveryone, setSearchEveryone] = useState(false);
   const [myNote, setMyNote] = useState('');
 
   const status = chat.unlock.status;
@@ -160,7 +163,7 @@ export function ConnectScreen({ chat }: Props) {
     () => peopleItems(chat.profiles, topic, new Set(chat.following.map((f) => f.id))),
     [chat.profiles, chat.following, topic]
   );
-  const peopleShown = people.slice(0, QUICK);
+  const peopleShown = searchEveryone ? people.slice(0, QUICK) : [];
   const followEmpty = followingEmptyText(chat.followingStatus, chat.following.length, followRows.length);
   const me = chat.account ? chat.profiles[chat.account] : undefined;
   const myName = displayName(me);
@@ -247,6 +250,7 @@ export function ConnectScreen({ chat }: Props) {
             onChangeText={(text) => {
               setTopic(text);
               setShowAll(false);
+              if (!text.trim()) setSearchEveryone(false);
             }}
             onSubmitEditing={() => {
               if (!connecting && topic.trim()) void doConnect();
@@ -292,6 +296,19 @@ export function ConnectScreen({ chat }: Props) {
                   }}
                 >
                   <Text style={styles.followEmpty}>{followEmpty}</Text>
+                </Pressable>
+              ) : null}
+              {!searchEveryone && topic.trim() && people.length > 0 ? (
+                <Pressable
+                  onPress={() => setSearchEveryone(true)}
+                  accessibilityRole="button"
+                  hitSlop={6}
+                  style={({ pressed }) => [styles.searchAll, pressed && styles.followPressed]}
+                >
+                  <Icon name="users" size={14} color={colors.cyan} />
+                  <Text style={styles.searchAllText} numberOfLines={1}>
+                    {`Search everyone for “${topic.trim()}” (${people.length})`}
+                  </Text>
                 </Pressable>
               ) : null}
               {peopleShown.length > 0 && (
@@ -607,6 +624,24 @@ const styles = StyleSheet.create({
   },
   peopleHead: {
     marginTop: 12,
+  },
+  searchAll: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginTop: 8,
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    borderRadius: radius.md,
+    borderWidth: 1,
+    borderColor: colors.hairline,
+    backgroundColor: colors.sunken,
+  },
+  searchAllText: {
+    color: colors.cyan,
+    fontSize: 13,
+    fontWeight: '600',
+    flexShrink: 1,
   },
   followList: {
     backgroundColor: colors.sunken,
