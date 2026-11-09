@@ -1,8 +1,11 @@
 # Installable Android test build on every push to main.
 #
-# Builds the release APK (JS bundled in, no dev server needed), signed with
-# the committed TEST key (android/app/e2ee-test.p12) so each build installs
-# over the previous one, and publishes it as the "android-latest" pre-release:
+# build:   release APK (JS bundled in, no dev server needed), signed with the
+#          committed TEST key (android/app/e2ee-test.p12) so each build
+#          installs over the previous one.
+# smoke:   installs it on an emulator, opens it, and fails if the app closes;
+#          the crash lines (or the first screen's text) become annotations.
+# publish: only after smoke passes, as the "android-latest" pre-release:
 #   https://github.com/1ksn1ks/hedera-e2ee-chat-app/releases/download/android-latest/hedera-e2ee-chat.apk
 # Store builds are not made here: they use the private upload key.
 name: Android test APK
@@ -19,13 +22,14 @@ concurrency:
   group: android-apk
   cancel-in-progress: true
 
+env:
+  APP_VERSION_CODE: ${{ github.run_number }}
+  APP_VERSION_NAME: 0.1.${{ github.run_number }}
+
 jobs:
-  apk:
+  build:
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    env:
-      APP_VERSION_CODE: ${{ github.run_number }}
-      APP_VERSION_NAME: 0.1.${{ github.run_number }}
     steps:
       - uses: actions/checkout@v5
 
@@ -54,13 +58,14 @@ jobs:
 
       # 4 GB heap: GitHub runners have 16 GB, and the 2 GB in gradle.properties
       # is tight for a release build (R8/lint/Hermes) of a React Native app.
+      # x86_64 is only for the emulator smoke test; phones use the arm builds.
       - name: Build the release APK (test-signed)
         working-directory: android
         run: |
           chmod +x gradlew
           set -o pipefail
           ./gradlew assembleRelease \
-            -PreactNativeArchitectures=arm64-v8a,armeabi-v7a \
+            -PreactNativeArchitectures=arm64-v8a,armeabi-v7a,x86_64 \
             "-Dorg.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g" \
             --no-daemon --stacktrace 2>&1 | tee gradle.log
 
@@ -87,16 +92,64 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: hedera-e2ee-chat-${{ github.run_number }}
+          name: hedera-e2ee-chat-apk
           path: hedera-e2ee-chat.apk
+          retention-days: 14
+
+  smoke:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: hedera-e2ee-chat-apk
+
+      - name: Enable KVM for the emulator
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Open the app on an Android emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          script: bash .github/scripts/android-smoke.sh hedera-e2ee-chat.apk
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: smoke-test
+          path: |
+            logcat.txt
+            ui.xml
+            screen.png
+          if-no-files-found: ignore
+          retention-days: 14
+
+  publish:
+    needs: smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: hedera-e2ee-chat-apk
 
       - name: Publish as the android-latest test build
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           gh release delete android-latest --yes --cleanup-tag || true
           gh release create android-latest hedera-e2ee-chat.apk \
             --prerelease \
             --target "$GITHUB_SHA" \
             --title "Android test build ${APP_VERSION_NAME}" \
-            --notes "Test build ${APP_VERSION_NAME} from ${GITHUB_SHA::7}. On the phone: download hedera-e2ee-chat.apk, open it, allow installing from this source. Each build installs over the previous one (same test signing key). Not a store build."
+            --notes "Test build ${APP_VERSION_NAME} from ${GITHUB_SHA::7}. Opened on an Android emulator before publishing. On the phone: download hedera-e2ee-chat.apk, open it, allow installing from this source. Each build installs over the previous one (same test signing key). Not a store build."
