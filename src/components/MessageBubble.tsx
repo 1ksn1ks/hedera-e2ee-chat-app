@@ -41,6 +41,8 @@ interface Props {
   onEdit: (bubble: Bubble) => void;
   /** Native list signal. Web uses IntersectionObserver and ignores this. */
   near: boolean;
+  /** Tapping the avatar shows only this sender's messages. */
+  onPickSender?: (payer: string) => void;
 }
 
 // Profile picture, or the default one when there is none or it fails to load.
@@ -381,7 +383,17 @@ function Playable({
   });
 }
 
-export function MessageBubble({ bubble, profile, showAvatar, showHeader, stamp, canEdit, onEdit, near }: Props) {
+export function MessageBubble({
+  bubble,
+  profile,
+  showAvatar,
+  showHeader,
+  stamp,
+  canEdit,
+  onEdit,
+  near,
+  onPickSender,
+}: Props) {
   const [expanded, setExpanded] = useState(false);
   const hostRef = useRef<View>(null);
   const onScreen = useBubbleNear(hostRef, near);
@@ -397,7 +409,22 @@ export function MessageBubble({ bubble, profile, showAvatar, showHeader, stamp, 
       ref={hostRef}
       style={[styles.row, mine && styles.rowMine, showAvatar ? styles.rowFirst : styles.rowNext]}
     >
-      <View style={styles.avatarCol}>{showAvatar && <Avatar profile={profile} />}</View>
+      <View style={styles.avatarCol}>
+        {showAvatar ? (
+          onPickSender ? (
+            <Pressable
+              onPress={() => onPickSender(bubble.payer)}
+              hitSlop={6}
+              accessibilityRole="button"
+              accessibilityLabel={`Show only messages from ${displayName(profile) || bubble.payer}`}
+            >
+              <Avatar profile={profile} />
+            </Pressable>
+          ) : (
+            <Avatar profile={profile} />
+          )
+        ) : null}
+      </View>
       <View style={[styles.bubbleCol, mine && styles.bubbleColMine]}>
         {showHeader && <RunHeader payer={bubble.payer} profile={profile} mine={mine} />}
         <Pressable

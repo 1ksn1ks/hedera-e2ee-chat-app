@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import {
   activeDomains,
   applySettings,
+  chatSenders,
   avatarFor,
   DEFAULT_AVATAR,
   displayName,
@@ -271,4 +272,35 @@ test('people search by username, id, or topic; topic holders first; Following ex
   assert.equal(hits[2].dim, true);
   assert.deepEqual(peopleItems(profiles, 'ali', new Set(['0.0.1'])).map((i) => i.id), ['0.0.3', '0.0.2']);
   assert.deepEqual(peopleItems(profiles, '0.0.44', new Set()).map((i) => i.id), ['0.0.4'], 'matches a connected topic');
+});
+
+test('chat senders: everyone who wrote, A-Z by shown name, with counts', () => {
+  const profiles = applySettings(
+    {},
+    [
+      { accountId: '0.0.3', username: 'zed', profilePic: 'https://x/z.jpg' },
+      { accountId: '0.0.1', username: 'Alice' },
+    ],
+    true
+  );
+  const bubbles = [
+    { payer: '0.0.3', mine: false },
+    { payer: '0.0.1', mine: false },
+    { payer: '0.0.20', mine: true },
+    { payer: '0.0.3', mine: false },
+    { payer: '0.0.1', mine: false },
+    { payer: '0.0.3', mine: false },
+  ];
+  const senders = chatSenders(bubbles, profiles);
+  assert.deepEqual(
+    senders.map((s) => [s.name, s.count, s.mine]),
+    [
+      ['0.0.20', 1, true],
+      ['Alice', 2, false],
+      ['zed', 3, false],
+    ]
+  );
+  assert.equal(senders[2].avatar, 'https://x/z.jpg');
+  assert.equal(senders[0].avatar, DEFAULT_AVATAR, 'no profile: default picture, account id as name');
+  assert.deepEqual(chatSenders([], profiles), []);
 });

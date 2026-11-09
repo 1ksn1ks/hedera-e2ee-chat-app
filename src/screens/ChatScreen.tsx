@@ -6,7 +6,9 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   FlatList,
+  Image,
   Pressable,
+  ScrollView,
   StyleSheet,
   Text,
   View,
@@ -21,7 +23,7 @@ import { RelayStatus } from '../components/RelayStatus';
 import { editOutgoingBytes, sendOutgoingBytes } from '../services/chatPayload';
 import { nearKeysForView } from '../services/decryptSlots';
 import { packFitting, type SealedMedia } from '../services/sealedMedia';
-import { displayName } from '../services/identity';
+import { chatSenders, displayName, type ChatSender } from '../services/identity';
 import {
   holdPreview,
   MEDIA_BLOCKED,
@@ -69,6 +71,40 @@ interface Props {
   chat: E2eeChat;
 }
 
+// One choice in the "by sender" strip: everyone, or one person.
+function SenderChip({
+  label,
+  count,
+  avatar,
+  active,
+  onPress,
+  onX,
+}: {
+  label: string;
+  count: number;
+  avatar?: string;
+  active: boolean;
+  onPress: () => void;
+  onX?: (x: number) => void;
+}) {
+  return (
+    <Pressable
+      onPress={onPress}
+      onLayout={onX ? (e) => onX(e.nativeEvent.layout.x) : undefined}
+      accessibilityRole="button"
+      accessibilityState={{ selected: active }}
+      accessibilityLabel={`${label}, ${count} ${count === 1 ? 'message' : 'messages'}`}
+      style={({ pressed }) => [styles.chip, active && styles.chipActive, pressed && styles.chipPressed]}
+    >
+      {avatar ? <Image source={{ uri: avatar }} style={styles.chipAvatar} /> : null}
+      <Text style={[styles.chipText, active && styles.chipTextActive]} numberOfLines={1}>
+        {label}
+      </Text>
+      <Text style={[styles.chipCount, active && styles.chipTextActive]}>{count}</Text>
+    </Pressable>
+  );
+}
+
 export function ChatScreen({ chat }: Props) {
   const [editing, setEditing] = useState<Bubble | null>(null);
   const [notice, setNotice] = useState('');
@@ -85,6 +121,42 @@ export function ChatScreen({ chat }: Props) {
   const topic = chat.meta?.topicId || '';
   const via = chat.meta?.via || '';
   const myName = chat.account ? displayName(chat.profiles[chat.account]) : '';
+
+  // "By sender": the strip lists everyone who wrote here, A–Z. Picking one
+  // shows only their messages; "All" is the normal time-ordered chat.
+  const [peopleOpen, setPeopleOpen] = useState(false);
+  const [onlyPayer, setOnlyPayer] = useState<string | null>(null);
+  const senders = useMemo(() => chatSenders(chat.bubbles, chat.profiles), [chat.bubbles, chat.profiles]);
+  const picked: ChatSender | null = onlyPayer ? senders.find((s) => s.payer === onlyPayer) || null : null;
+  const showSender = useCallback((payer: string | null) => {
+    // Land on the newest message of the new selection.
+    atBottomRef.current = true;
+    setOnlyPayer(payer);
+    if (payer) setPeopleOpen(true);
+  }, []);
+
+  // Another chat starts unfiltered.
+  useEffect(() => {
+    setOnlyPayer(null);
+    setPeopleOpen(false);
+  }, [topic]);
+
+  // Keep the chosen person's chip in view (it can sit off the right edge).
+  const stripRef = useRef<ScrollView>(null);
+  const chipX = useRef<Record<string, number>>({});
+  const onlyPayerRef = useRef(onlyPayer);
+  onlyPayerRef.current = onlyPayer;
+  const revealChip = useCallback((payer: string | null) => {
+    if (!payer) {
+      stripRef.current?.scrollTo({ x: 0, animated: true });
+      return;
+    }
+    const x = chipX.current[payer];
+    if (x !== undefined) stripRef.current?.scrollTo({ x: Math.max(0, x - 56), animated: true });
+  }, []);
+  useEffect(() => {
+    revealChip(onlyPayer);
+  }, [onlyPayer, revealChip]);
 
   const flash = useCallback((text: string) => {
     setNotice(text);
@@ -187,21 +259,20 @@ export function ChatScreen({ chat }: Props) {
 
   // Grouping: the avatar + name show on the first message of a payer run.
   // A new day starts a new run under its own divider.
-  const rows = useMemo(
-    () =>
-      chat.bubbles.map((b, i) => {
-        const prev = i > 0 ? chat.bubbles[i - 1] : null;
-        const newDay = !prev || dayKey(prev.created) !== dayKey(b.created);
-        const newGroup = !prev || prev.payer !== b.payer || newDay;
-        return {
-          bubble: b,
-          showAvatar: newGroup,
-          showHeader: newGroup,
-          day: newDay ? dayLabel(b.created) : '',
-        };
-      }),
-    [chat.bubbles]
-  );
+  const rows = useMemo(() => {
+    const shown = onlyPayer ? chat.bubbles.filter((b) => b.payer === onlyPayer) : chat.bubbles;
+    return shown.map((b, i) => {
+      const prev = i > 0 ? shown[i - 1] : null;
+      const newDay = !prev || dayKey(prev.created) !== dayKey(b.created);
+      const newGroup = !prev || prev.payer !== b.payer || newDay;
+      return {
+        bubble: b,
+        showAvatar: newGroup,
+        showHeader: newGroup,
+        day: newDay ? dayLabel(b.created) : '',
+      };
+    });
+  }, [chat.bubbles, onlyPayer]);
   const rowsRef = useRef(rows);
   rowsRef.current = rows;
 
@@ -261,8 +332,58 @@ export function ChatScreen({ chat }: Props) {
             {via ? `${topic} · ` : ''}End-to-end encrypted · {who}
           </Text>
         </View>
+        <Pressable
+          onPress={() => {
+            if (peopleOpen && !onlyPayer) setPeopleOpen(false);
+            else setPeopleOpen(true);
+          }}
+          hitSlop={6}
+          accessibilityRole="button"
+          accessibilityLabel="Show messages by sender"
+          accessibilityState={{ expanded: peopleOpen || !!onlyPayer }}
+          style={({ pressed }) => [
+            styles.peopleBtn,
+            (peopleOpen || onlyPayer) && styles.peopleBtnActive,
+            pressed && styles.backPressed,
+          ]}
+        >
+          <Icon name="users" size={18} color={peopleOpen || onlyPayer ? colors.cyan : colors.textSoft} />
+        </Pressable>
         <RelayStatus compact useRelay={chat.useRelay} transport={chat.transport} onToggle={chat.setUseRelay} />
       </View>
+
+      {(peopleOpen || onlyPayer) && senders.length > 0 ? (
+        <View style={styles.strip}>
+          <ScrollView
+            ref={stripRef}
+            horizontal
+            showsHorizontalScrollIndicator={false}
+            contentContainerStyle={styles.stripRow}
+          >
+            <SenderChip
+              label="All"
+              count={chat.bubbles.length}
+              active={!onlyPayer}
+              onPress={() => showSender(null)}
+            />
+            {senders.map((s) => (
+              <SenderChip
+                key={s.payer}
+                label={s.mine ? `${s.name} (you)` : s.name}
+                count={s.count}
+                avatar={s.avatar}
+                active={onlyPayer === s.payer}
+                onPress={() => showSender(onlyPayer === s.payer ? null : s.payer)}
+                onX={(x) => {
+                  chipX.current[s.payer] = x;
+                  // The strip opened by an avatar tap lays out after the pick.
+                  if (onlyPayerRef.current === s.payer) revealChip(s.payer);
+                }}
+              />
+            ))}
+          </ScrollView>
+        </View>
+      ) : null}
 
       <View style={styles.body}>
         {notice ? (
@@ -304,6 +425,7 @@ export function ChatScreen({ chat }: Props) {
                 canEdit={item.bubble.mine}
                 onEdit={(b) => setEditing(b)}
                 near={nearKeys.has(item.bubble.sig)}
+                onPickSender={showSender}
               />
             </>
           )}
@@ -313,7 +435,11 @@ export function ChatScreen({ chat }: Props) {
                 <Icon name="lock" size={26} color={colors.cyan} />
               </View>
               <Text style={styles.emptyTitle}>
-                {chat.unlock.status === 'unlocked' ? 'No messages yet' : 'Locked'}
+                {onlyPayer
+                  ? `No messages from ${picked ? picked.name : onlyPayer}`
+                  : chat.unlock.status === 'unlocked'
+                    ? 'No messages yet'
+                    : 'Locked'}
               </Text>
               <Text style={styles.emptyText}>
                 {chat.unlock.status === 'unlocked'
@@ -371,6 +497,71 @@ const styles = StyleSheet.create({
   },
   backPressed: {
     backgroundColor: colors.cardRaised,
+  },
+  peopleBtn: {
+    width: 36,
+    height: 36,
+    borderRadius: radius.pill,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: colors.stroke,
+    backgroundColor: colors.cardRaised,
+  },
+  peopleBtnActive: {
+    borderColor: colors.cyanSoft,
+    backgroundColor: colors.cyanFaint,
+  },
+  strip: {
+    backgroundColor: colors.card,
+    borderBottomWidth: 1,
+    borderBottomColor: colors.hairline,
+  },
+  stripRow: {
+    gap: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+  },
+  chip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    height: 32,
+    paddingLeft: 6,
+    paddingRight: 10,
+    borderRadius: radius.pill,
+    borderWidth: 1,
+    borderColor: colors.stroke,
+    backgroundColor: colors.cardRaised,
+    maxWidth: 220,
+  },
+  chipActive: {
+    borderColor: colors.cyan,
+    backgroundColor: colors.cyanFaint,
+  },
+  chipPressed: {
+    opacity: 0.8,
+  },
+  chipAvatar: {
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    backgroundColor: colors.bg,
+  },
+  chipText: {
+    color: colors.textSoft,
+    fontSize: 13,
+    fontWeight: '600',
+    flexShrink: 1,
+    paddingLeft: 4,
+  },
+  chipTextActive: {
+    color: colors.cyan,
+  },
+  chipCount: {
+    color: colors.muted,
+    fontSize: 12,
+    fontWeight: '600',
   },
   topicMark: {
     width: 38,

@@ -443,6 +443,46 @@ export function peopleItems(profiles: ProfileMap, query: string, exclude: Set<st
   return items;
 }
 
+export interface ChatSender {
+  payer: string;
+  // Username, or the account id when there is none.
+  name: string;
+  avatar: string;
+  count: number;
+  mine: boolean;
+}
+
+// Everyone who wrote in the open chat, A–Z by shown name (like the Globe
+// map's A–Z sort of chat groups), each with how many messages they sent.
+export function chatSenders(
+  bubbles: ReadonlyArray<{ payer: string; mine: boolean }>,
+  profiles: ProfileMap
+): ChatSender[] {
+  const byPayer = new Map<string, ChatSender>();
+  for (const b of bubbles || []) {
+    if (!b || !b.payer) continue;
+    const known = byPayer.get(b.payer);
+    if (known) {
+      known.count += 1;
+      if (b.mine) known.mine = true;
+      continue;
+    }
+    const p = profiles[b.payer];
+    byPayer.set(b.payer, {
+      payer: b.payer,
+      name: displayName(p) || b.payer,
+      avatar: avatarFor(p),
+      count: 1,
+      mine: !!b.mine,
+    });
+  }
+  return [...byPayer.values()].sort(
+    (a, b) =>
+      a.name.localeCompare(b.name, undefined, { sensitivity: 'base', numeric: true }) ||
+      a.payer.localeCompare(b.payer, undefined, { numeric: true })
+  );
+}
+
 // followingstate.js followingEmptyText, for the list under the topic input.
 export type FollowingStatus = 'nowallet' | 'loading' | 'ready' | 'offline';
 
