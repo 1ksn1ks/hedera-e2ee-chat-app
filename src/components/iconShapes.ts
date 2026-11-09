@@ -15,7 +15,8 @@ export type IconName =
   | 'key'
   | 'hash'
   | 'server'
-  | 'globe';
+  | 'globe'
+  | 'copy';
 
 export type IconShape =
   | { t: 'path'; d: string }
@@ -56,4 +57,5 @@ export const ICONS: Record<IconName, IconShape[]> = {
     p('M7 16.5h.01'),
   ],
   globe: [{ t: 'circle', cx: 12, cy: 12, r: 9 }, p('M3 12h18'), p('M12 3a14 14 0 0 1 0 18'), p('M12 3a14 14 0 0 0 0 18')],
+  copy: [{ t: 'rect', x: 9, y: 9, width: 12, height: 12, rx: 2 }, p('M15 9V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h4')],
 };

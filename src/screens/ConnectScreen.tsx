@@ -26,6 +26,7 @@ import {
   peopleItems,
   type FollowItem,
 } from '../services/identity';
+import { copyText } from '../services/clipboard';
 
 interface Props {
   chat: E2eeChat;
@@ -134,6 +135,18 @@ export function ConnectScreen({ chat }: Props) {
   // Typing filters only the people you follow. Everyone else shows only
   // after "Search everyone" is tapped; clearing the field hides them again.
   const [searchEveryone, setSearchEveryone] = useState(false);
+  // "Copied" shows for 2 s after the pairing link is copied.
+  const [copied, setCopied] = useState(false);
+  const doCopyPairing = async (uri: string) => {
+    if (!uri) return;
+    const ok = await copyText(uri);
+    if (!ok) {
+      setError("Couldn't copy. Long-press the link to select it instead.");
+      return;
+    }
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
   const [myNote, setMyNote] = useState('');
 
   const status = chat.unlock.status;
@@ -527,9 +540,26 @@ export function ConnectScreen({ chat }: Props) {
           )}
           {chat.pairingUri && !chat.account && (
             <View style={styles.pairingBox}>
-              <Text style={baseStyles.label}>Pairing link</Text>
+              <View style={styles.pairingHead}>
+                <Text style={baseStyles.label}>Pairing link</Text>
+                <Pressable
+                  onPress={() => {
+                    void doCopyPairing(chat.pairingUri || '');
+                  }}
+                  hitSlop={8}
+                  accessibilityRole="button"
+                  accessibilityLabel="Copy pairing link"
+                  style={({ pressed }) => [styles.copyBtn, copied && styles.copyBtnDone, pressed && styles.followPressed]}
+                >
+                  <Icon name={copied ? 'check' : 'copy'} size={14} color={colors.cyan} />
+                  <Text style={styles.copyText}>{copied ? 'Copied' : 'Copy'}</Text>
+                </Pressable>
+              </View>
               <Text style={styles.pairing} selectable>
                 {chat.pairingUri}
+              </Text>
+              <Text style={styles.pairingHint}>
+                Paste it into your wallet's "connect with link" (WalletConnect).
               </Text>
             </View>
           )}
@@ -768,6 +798,35 @@ const styles = StyleSheet.create({
     color: colors.muted,
     fontSize: 13,
     lineHeight: 18,
+  },
+  pairingHead: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  copyBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    height: 30,
+    paddingHorizontal: 12,
+    borderRadius: radius.pill,
+    borderWidth: 1,
+    borderColor: colors.cyanSoft,
+    backgroundColor: colors.cyanFaint,
+  },
+  copyBtnDone: {
+    borderColor: colors.cyan,
+  },
+  copyText: {
+    color: colors.cyan,
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  pairingHint: {
+    color: colors.muted,
+    fontSize: 12,
+    lineHeight: 16,
   },
   pairingBox: {
     gap: 6,
