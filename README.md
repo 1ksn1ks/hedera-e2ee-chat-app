@@ -8,6 +8,36 @@ Header, grouped bubbles, bottom composer. Dark glass, cyan accents. No map, no f
 
 ---
 
+## 🚀 Getting started
+
+### Install a test build (Android)
+
+Every push to `main` builds an APK (`.github/workflows/android-apk.yml`) and publishes it as the `android-latest` pre-release. On the phone, open:
+
+https://github.com/1ksn1ks/hedera-e2ee-chat-app/releases/download/android-latest/hedera-e2ee-chat.apk
+
+Then open the file and allow installs from that source.
+
+Test builds are signed with the committed `android/app/e2ee-test.p12`, so each one installs over the last and keeps the saved topic keys. That key is public on purpose and is only for test builds. Store builds use the private upload key in `android/keystore.properties`, which is never committed. The two keys differ, so uninstall the test build before installing a store build. There is no GitHub install path for iOS; use TestFlight.
+
+Package id is `com.hederae2eechat`, separate from the notifier, so the two apps do not overwrite each other.
+
+### From source
+
+Node `>= 22.11.0`.
+
+```bash
+npm install
+npm run start:web    # browser preview on :5175
+npm test             # wire, mirror, transport, payload, media
+npm run typecheck    # tsc --noEmit
+npm run android      # device build (iOS: pod install, then npm run ios)
+```
+
+The app calls `https://onlyonhbar.com` unless `globalThis.__E2EE_BACKEND_URL__` is set. An empty string stays on the page origin. The Vite preview proxies `/api` to `http://127.0.0.1:8787`, so that empty override uses a local copy of the globe server. If 5175 is taken, Vite prints the port it picked.
+
+---
+
 ## ✨ Features
 
 - **🔐 Sealed topic chat** — `crypto_box_seal` (libsodium, Ed25519 → X25519). Plaintext never goes on chain. A viewer without the topic key sees nothing to read.
@@ -72,34 +102,6 @@ Same bytes as `encryptedtopicchat.js`, `sodium.js`, and `msgbackend.js` in the g
 | **Wallet** | WalletConnect, `@hashgraph/sdk` |
 | **Browser preview** | Vite on port 5175 |
 | **Relay** | The globe backend at [onlyonhbar.com](https://onlyonhbar.com). Mirror fallback is `mainnet-public.mirrornode.hedera.com` |
-
----
-
-## 🚀 Getting started
-
-Node `>= 22.11.0`.
-
-```bash
-npm install
-npm run start:web    # browser preview on :5175
-npm test             # wire, mirror, transport, payload, media
-npm run typecheck    # tsc --noEmit
-npm run android      # device build (iOS: pod install, then npm run ios)
-```
-
-The app calls `https://onlyonhbar.com` unless `globalThis.__E2EE_BACKEND_URL__` is set. An empty string stays on the page origin. The Vite preview proxies `/api` to `http://127.0.0.1:8787`, so that empty override uses a local copy of the globe server. If 5175 is taken, Vite prints the port it picked.
-
-### Install a test build (Android)
-
-Every push to `main` builds an APK (`.github/workflows/android-apk.yml`) and publishes it as the `android-latest` pre-release. On the phone, open:
-
-https://github.com/1ksn1ks/hedera-e2ee-chat-app/releases/download/android-latest/hedera-e2ee-chat.apk
-
-Then open the file and allow installs from that source.
-
-Test builds are signed with the committed `android/app/e2ee-test.p12`, so each one installs over the last and keeps the saved topic keys. That key is public on purpose and is only for test builds. Store builds use the private upload key in `android/keystore.properties`, which is never committed. The two keys differ, so uninstall the test build before installing a store build. There is no GitHub install path for iOS; use TestFlight.
-
-Package id is `com.hederae2eechat`, separate from the notifier, so the two apps do not overwrite each other.
 
 ---
 
