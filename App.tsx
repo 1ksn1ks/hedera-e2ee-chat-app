@@ -4,7 +4,11 @@
 // useE2eeChat and survives the screen switch.
 import React from 'react';
 import { StatusBar, useWindowDimensions, View } from 'react-native';
-import { initialWindowMetrics, SafeAreaProvider } from 'react-native-safe-area-context';
+import {
+  initialWindowMetrics,
+  SafeAreaProvider,
+  SafeAreaView,
+} from 'react-native-safe-area-context';
 import { useE2eeChat } from './src/hooks/useE2eeChat';
 import { ConnectScreen } from './src/screens/ConnectScreen';
 import { ChatScreen } from './src/screens/ChatScreen';
@@ -25,8 +29,11 @@ function Chat() {
   }
 
   return (
-    <View style={{ flex: 1, backgroundColor: colors.bg }}>
-      <StatusBar barStyle="light-content" backgroundColor={colors.card} />
+    <SafeAreaView
+      style={{ flex: 1, backgroundColor: inChat ? colors.card : colors.bg }}
+      edges={['top', 'left', 'right']}
+    >
+      <StatusBar barStyle="light-content" backgroundColor="transparent" />
       <View
         style={[
           { flex: 1, width: '100%', maxWidth: MAX_COLUMN, alignSelf: 'center' },
@@ -35,13 +42,13 @@ function Chat() {
       >
         {inChat ? <ChatScreen chat={chat} /> : <ConnectScreen chat={chat} />}
       </View>
-    </View>
+    </SafeAreaView>
   );
 }
 
 export default function App() {
   return (
-    <SafeAreaProvider initialMetrics={initialWindowMetrics}>
+    <SafeAreaProvider initialMetrics={initialWindowMetrics} style={{ flex: 1, backgroundColor: colors.bg }}>
       <Chat />
     </SafeAreaProvider>
   );
