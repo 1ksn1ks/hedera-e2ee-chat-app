@@ -7,6 +7,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { AppState, type AppStateStatus } from 'react-native';
 import {
+  accountForUsername,
   applySettings,
   isTopicId,
   resolvePerson,
@@ -141,13 +142,17 @@ export function useIdentity(getMode: () => TransportMode, account: string | null
     if (profilesRun.current) await profilesRun.current;
   }, [refreshDomains]);
 
-  // The topic field: a topic id or a domain. Waits for the launch reads so
-  // a domain typed right away still resolves.
+  // The topic field: a topic id, a domain, or a person. Waits for the launch
+  // reads so a domain typed right away still resolves. A typed account, and
+  // a typed username's account, recheck the chain so a topic connected just
+  // now is found.
   const resolve = useCallback(
     async (input: string): Promise<ResolvedTopic> => {
       await launchReads();
       const value = String(input || '').trim().toLowerCase();
       await freshLinksFor(value.split('-')[0]);
+      const named = accountForUsername(value, profilesRef.current);
+      if (named) await freshLinksFor(named);
       const ctx = () => ({
         domains: domainsRef.current,
         profiles: profilesRef.current,

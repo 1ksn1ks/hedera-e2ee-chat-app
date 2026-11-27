@@ -291,11 +291,27 @@ function noTopicError(accountId: string): string {
   return `${accountId} has no public topic connected — connect one in Edit profile first.`;
 }
 
-// The topic field takes a topic id or a domain only. A user (account id or
-// username) is never opened from the field: their row under Following or
-// People is tapped, and resolvePerson opens their connected topic. A typed
-// name would otherwise let a copied username win, and a typed account id
-// would open whatever topic it points at without the person being shown.
+const ACCOUNT_INPUT = /^(0\.0\.\d+)(?:-[a-z0-9]+)?$/;
+
+// Exact display name, case-insensitive. Several matches: a profile with a
+// connected topic wins, otherwise the first. An account-shaped input is not
+// a username. Impersonation does not matter: the topic key protects the chat.
+export function accountForUsername(input: string, profiles: ProfileMap): string | null {
+  const name = String(input || '').trim().toLowerCase();
+  if (!name || ACCOUNT_INPUT.test(name)) return null;
+  let first = '';
+  for (const [id, profile] of Object.entries(profiles || {})) {
+    if (displayName(profile).toLowerCase() !== name) continue;
+    if (!first) first = id;
+    if (isTopicId(profile.topic)) return id;
+  }
+  return first || null;
+}
+
+// The topic field takes a topic id, a domain, or a person. A typed account
+// id or username opens that profile's connected topic, the same way tapping
+// them under Following or People does. A known or mirror-confirmed account
+// with no topic is an error. An id the mirror does not know is a topic id.
 // isAccount asks the mirror whether a 0.0.N id is an account (account and
 // topic ids share that shape).
 export async function resolveTopicInput(
@@ -311,15 +327,14 @@ export async function resolveTopicInput(
   const domain = ctx.domains.find((entry) => entry.domain === value);
   if (domain && isTopicId(domain.topic)) return { topicId: domain.topic, via: domain.domain };
   const bare = value.split('-')[0];
-  if (/^(0\.0\.\d+)(?:-[a-z0-9]+)?$/.test(value)) {
+  if (ACCOUNT_INPUT.test(value)) {
     const known = ctx.profiles[bare];
-    if (known && known.topic) return { error: `${bare} is an account. ${PICK_PERSON}` };
+    if (known && isTopicId(known.topic)) return resolvePerson(bare, ctx.profiles);
     if (known || (await ctx.isAccount(bare))) return { error: noTopicError(bare) };
     return { topicId: bare, via: null };
   }
-  if (Object.values(ctx.profiles).some((p) => displayName(p).toLowerCase() === value)) {
-    return { error: `"${value}" is a username. ${PICK_PERSON}` };
-  }
+  const named = accountForUsername(value, ctx.profiles);
+  if (named) return resolvePerson(named, ctx.profiles);
   return { error: 'No domain by that name. Enter a topic ID (0.0.123) or a domain.' };
 }
 

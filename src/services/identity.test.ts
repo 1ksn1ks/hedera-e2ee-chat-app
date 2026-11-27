@@ -117,12 +117,14 @@ test('domains follow the 28-day ownership chain', () => {
   assert.equal(byName.delta, undefined, 'pending rows are not purchases');
 });
 
-test('the topic field takes a topic id or a domain; a user must be tapped', async () => {
+test('the topic field takes a topic id, a domain, or a person', async () => {
   const profiles: ProfileMap = applySettings(
     {},
     [
       { accountId: '0.0.10', username: 'has topic', topic: '0.0.900' },
       { accountId: '0.0.11', username: 'no topic' },
+      { accountId: '0.0.13', username: 'twin' },
+      { accountId: '0.0.14', username: 'twin', topic: '0.0.914' },
     ],
     true
   );
@@ -141,11 +143,13 @@ test('the topic field takes a topic id or a domain; a user must be tapped', asyn
   assert.deepEqual(await resolveTopicInput('  Alpha ', ctx), { topicId: '0.0.101', via: 'alpha' });
   assert.deepEqual(await resolveTopicInput('0.0.555', ctx), { topicId: '0.0.555', via: null });
   assert.deepEqual(await resolveTopicInput('0.0.555-abcde', ctx), { topicId: '0.0.555', via: null }, 'checksum dropped');
-  assert.match(await err('0.0.10'), /^0\.0\.10 is an account\. Tap them under People/, 'a typed account never opens');
-  assert.match(await err('0.0.10-abcde'), /^0\.0\.10 is an account/);
+  assert.deepEqual(await resolveTopicInput('0.0.10', ctx), { topicId: '0.0.900', via: '0.0.10' });
+  assert.deepEqual(await resolveTopicInput('0.0.10-abcde', ctx), { topicId: '0.0.900', via: '0.0.10' });
   assert.match(await err('0.0.11'), /^0\.0\.11 has no public topic connected/);
   assert.match(await err('0.0.12'), /^0\.0\.12 has no public topic connected/, 'an account without a profile card');
-  assert.match(await err('Has Topic'), /is a username\. Tap them under People/, 'a typed username never opens');
+  assert.deepEqual(await resolveTopicInput('Has Topic', ctx), { topicId: '0.0.900', via: '0.0.10' });
+  assert.match(await err('No Topic'), /^0\.0\.11 has no public topic connected/);
+  assert.deepEqual(await resolveTopicInput('Twin', ctx), { topicId: '0.0.914', via: '0.0.14' });
   assert.match(await err('unknown words'), /^No domain by that name/);
   assert.ok('error' in (await resolveTopicInput('   ', ctx)));
   assert.deepEqual(asked, ['0.0.555', '0.0.555', '0.0.12'], 'the mirror is asked only about unknown ids');
